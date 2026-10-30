@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "binaries": [
+    {
+      "name": "yt-dlp",
+      "version": "2026.10.26",
+      "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.10.26/yt-dlp_macos",
+      "sha256": "0f922c15ccc0b83eefa1c8bc9104e434318c4bf16e408e1ee93b7745a6efe0aa",
+      "executableSHA256": "0f922c15ccc0b83eefa1c8bc9104e434318c4bf16e408e1ee93b7745a6efe0aa"
+    },
+    {
+      "name": "deno-arm64",
+      "version": "v2.9.8",
+      "url": "https://github.com/denoland/deno/releases/download/v2.9.8/deno-aarch64-apple-darwin.zip",
+      "sha256": "9f0bf660393da2eaff044cdc7444cb08c73f235849b61d224d825a194ce7c98e",
+      "archiveMember": "deno",
+      "executableSHA256": "d1e99265e5e6ee096c5780d88ff7d3e6cfdf33b1953a118b4889cab8ca6980ba"
+    },
+    {
+      "name": "deno-x86_64",
+      "version": "v2.9.8",
+      "url": "https://github.com/denoland/deno/releases/download/v2.9.8/deno-x86_64-apple-darwin.zip",
+      "sha256": "4b2f5edd2639b7470f034238b321d7002d8dfb4726d8558f52c17afac370eb2c",
+      "archiveMember": "deno",
+      "executableSHA256": "5d206ba69742549cc161db06e86f1d93c5622e1dbc8ba9d15a618e538fbc92f4"
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+# Local build products and downloaded upstream executables
+/build/
+/.build/
+/dist/
+/DerivedData/
+/Resources/Helpers/yt-dlp
+/Resources/Helpers/deno-arm64
+/Resources/Helpers/deno-x86_64
+/Resources/Helpers/.download-*/
+*.dmg
+*.zip
+*.log
+__pycache__/
+*.pyc
+.DS_Store
+.AppleDouble/
+.env
+.env.*
+# Personal runtime data never belongs in the repository
+/history*.json
+/Media/
+/Downloads/
+/Cloud Bridge/

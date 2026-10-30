@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "executableSHA256": "57cafbbc79af86c51501998cc265acaec1117f9757f7d634008f9c37986e1a15",
+  "sources": {
+    "Sources/CloudMenu.swift": "fc8306ad6fddf1fe83532f1c61cebb80c75e46fe63970416193a9b00ec13cb57",
+    "Sources/CloudBridgeProtocol.swift": "76732bd2e1045b4263fd38d7012c4e0b2ca4e6039fa4f956f5e44a1fd5fda496",
+    "CloudHelper/NativeCloudUpdateBridge.swift": "d378875565ba5e5354ad40b3a720d559bbd2130116e7fdd6d5af9e551af7c8b5",
+    "CloudHelper/main.swift": "651b8d444a61bc5aacdc3526ca552cb81018a4e17427fe1ad4a58ca3aeecec01",
+    "CloudHelper/Info.plist": "e59463e5bdd050afc1f91475a1b8c93b11086f687f91cda6ee3d3c0ec3a30566"
+  }
+}

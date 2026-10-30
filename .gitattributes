@@ -1,0 +1,16 @@
+* text=auto
+*.swift text eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+# Preserve the pinned component byte-for-byte, including its signature.
+Resources/Cloud/** -text
+*.icns -text
+*.png -text
+*.jpg -text
+*.mp3 -text
+*.m4a -text
+# Keep upstream notices and the pinned helper source byte-for-byte.
+Resources/Licenses/** -whitespace
+Sources/CloudMenu.swift whitespace=-blank-at-eof

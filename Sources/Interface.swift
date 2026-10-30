@@ -1,0 +1,357 @@
+import SwiftUI
+import AppKit
+
+private let accent = Color(nsColor: .systemPink)
+
+struct DropPanel: View {
+    @ObservedObject var store: ImportStore
+    @ObservedObject var soundCloud: SoundCloudStore
+    @ObservedObject var youtube: YouTubeStore
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var fileTargeted = false
+    @State private var selectedTab = 0
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+            Picker("Раздел", selection: $selectedTab) {
+                Text("Медиатека").tag(0)
+                Text("SoundCloud").tag(1)
+                Text("YouTube").tag(2)
+            }
+            .pickerStyle(.segmented).labelsHidden().padding(.horizontal, 20).padding(.bottom, 14)
+            if selectedTab == 2 {
+                YouTubePanel(model: youtube, imports: store)
+            } else if selectedTab == 1 {
+                SoundCloudPanel(model: soundCloud, imports: store)
+            } else {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    dropZone
+                    if let notice = store.notice { noticeView(notice) }
+                    if store.settingsVisible { settings }
+                    history
+                }
+                .padding(.horizontal, 20)
+                .padding(.bottom, 20)
+            }
+            }
+            footer
+        }
+        .frame(width: 380, height: 540)
+        .background(.regularMaterial)
+        .animation(reduceMotion ? nil : .easeInOut(duration: 0.18), value: store.dragActive || fileTargeted)
+        .animation(reduceMotion ? nil : .easeInOut(duration: 0.18), value: store.settingsVisible)
+        .onDrop(of: [.fileURL], isTargeted: $fileTargeted, perform: acceptProviders)
+    }
+
+    private var header: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "music.note")
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundStyle(accent)
+                .frame(width: 34, height: 34)
+                .background(accent.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Music Drop").font(.system(size: 16, weight: .semibold))
+                Text("Твоя музыка. В твоей медиатеке.")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button { selectedTab = 0; store.settingsVisible.toggle() } label: {
+                Image(systemName: "slider.horizontal.3").font(.system(size: 14))
+                    .frame(width: 28, height: 28)
+            }
+            .buttonStyle(.borderless)
+            .help("Настройки")
+            .accessibilityLabel("Настройки")
+        }
+        .padding(20)
+    }
+
+    private var dropZone: some View {
+        let targeted = store.dragActive || fileTargeted
+        return VStack(spacing: 12) {
+            Image(systemName: targeted ? "arrow.down.document.fill" : "arrow.down.document")
+                .font(.system(size: 30, weight: .light))
+                .foregroundStyle(accent)
+                .frame(height: 38)
+                .scaleEffect(targeted ? 1.08 : 1)
+            VStack(spacing: 5) {
+                Text(targeted ? "Отпусти — и готово" : "Перетащи сюда MP3")
+                    .font(.system(size: 18, weight: .semibold))
+                Text("В медиатеку и избранное")
+                    .font(.system(size: 12)).foregroundStyle(.secondary)
+            }
+            Button("Выбрать файлы…") { store.chooseFiles() }
+                .buttonStyle(.borderedProminent)
+                .tint(accent)
+                .controlSize(.regular)
+                .keyboardShortcut("o", modifiers: .command)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 23)
+        .background(targeted ? accent.opacity(0.10) : Color(nsColor: .controlBackgroundColor).opacity(0.45),
+                    in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .strokeBorder(targeted ? accent : Color.primary.opacity(0.13),
+                              style: StrokeStyle(lineWidth: targeted ? 1.5 : 1, dash: targeted ? [] : [5, 4]))
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Зона добавления MP3. Можно также нажать «Выбрать файлы».")
+    }
+
+    private func noticeView(_ text: String) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "info.circle").foregroundStyle(.secondary)
+            Text(text).font(.system(size: 12)).fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+            Button { store.notice = nil } label: { Image(systemName: "xmark").font(.system(size: 10)) }
+                .buttonStyle(.borderless).accessibilityLabel("Скрыть сообщение")
+        }
+        .padding(12)
+        .background(.quaternary.opacity(0.6), in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    private var history: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("ПОСЛЕДНИЕ ДОБАВЛЕНИЯ")
+                    .font(.system(size: 10, weight: .semibold)).tracking(0.8).foregroundStyle(.secondary)
+                Spacer()
+                if store.activeCount > 0 {
+                    Text("В очереди: \(store.activeCount)").font(.system(size: 10)).foregroundStyle(.secondary)
+                } else if !store.entries.isEmpty {
+                    Button { store.refreshCloud() } label: {
+                        Image(systemName: "arrow.clockwise").font(.system(size: 11))
+                    }
+                    .disabled(store.refreshInProgress)
+                    .buttonStyle(.borderless).help("Проверить облачный статус")
+                    .accessibilityLabel("Проверить облачный статус")
+                }
+            }
+            if store.entries.isEmpty {
+                VStack(spacing: 7) {
+                    Image(systemName: "music.note.list").font(.system(size: 22, weight: .light))
+                        .foregroundStyle(.tertiary)
+                    Text("Здесь появятся твои треки").font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    Text("Оригиналы файлов останутся на месте")
+                        .font(.system(size: 11)).foregroundStyle(.tertiary)
+                }
+                .frame(maxWidth: .infinity).padding(.vertical, 20)
+            } else {
+                LazyVStack(spacing: 0) {
+                    ForEach(Array(store.entries.prefix(100))) { entry in
+                        HistoryRow(entry: entry, store: store)
+                        if entry.id != store.entries.prefix(100).last?.id { Divider().padding(.leading, 44) }
+                    }
+                }
+            }
+        }
+    }
+
+    private var settings: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Toggle("Запускать при входе в macOS", isOn: Binding(
+                get: { store.loginEnabled }, set: { store.setLogin($0) }))
+                .toggleStyle(.switch).controlSize(.small).font(.system(size: 12))
+            Text("Каждый MP3 добавляется в медиатеку и отмечается звездой. При необходимости «Музыка» запускается автоматически в фоне.")
+                .font(.system(size: 11)).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Text("Чтобы треки появились на других устройствах, включи «Синхронизацию медиатеки» в настройках «Музыки».")
+                .font(.system(size: 11)).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Button("Открыть «Музыку»") { store.openMusic() }
+                Spacer()
+                Button("Папка файлов") { NSWorkspace.shared.open(store.directory) }
+            }
+            .font(.system(size: 11)).buttonStyle(.borderless)
+            Text("Music Drop хранит копии MP3. Не удаляй их, если «Музыка» использует эти файлы без собственного копирования.")
+                .font(.system(size: 10)).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if store.hasAutomationError {
+                Button("Разрешить управление «Музыкой»…") {
+                    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation")!)
+                }.font(.system(size: 11))
+            }
+            Button("Разрешение для обновления облака…") { CloudUpdateBridge.openPermissionSettings() }
+                .font(.system(size: 11))
+            Text("Для обновления облака разреши Music Drop Cloud в разделе «Универсальный доступ». Этот отдельный компонент сохраняется при обновлениях Music Drop.")
+                .font(.system(size: 10)).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(13)
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.5), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private var footer: some View {
+        VStack(spacing: 0) {
+            Divider()
+            HStack(spacing: 6) {
+                if store.activeCount > 0 || soundCloud.isDownloading || youtube.isDownloading {
+                    ProgressView().controlSize(.mini).scaleEffect(0.8)
+                    Text(youtube.isDownloading ? "Скачиваем с YouTube…" : soundCloud.isDownloading ? "Скачиваем с SoundCloud…" : store.cloudUpdateInProgress ? "Запрашиваем обновление облака…" : "Добавляем в «Музыку»…")
+                } else {
+                    Circle().fill(store.cloudWaitingCount > 0 ? Color.orange : Color.green).frame(width: 5, height: 5)
+                    Text(store.cloudWaitingCount > 0 ? "Ожидают облака: \(store.cloudWaitingCount)" : "Готово к новым трекам")
+                }
+                Spacer()
+                Menu {
+                    Button("Обновить облачную медиатеку") { store.requestCloudUpdate() }
+                        .disabled(store.cloudUpdateInProgress || store.successfulCount == 0)
+                    Button("Открыть «Музыку»") { store.openMusic() }
+                    Button("Показать файлы программы") { NSWorkspace.shared.open(store.directory) }
+                    Divider()
+                    Text("Music Drop \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.5.2") · Только личная медиатека")
+                    Button("Завершить Music Drop") { NSApp.terminate(nil) }.keyboardShortcut("q")
+                } label: { Image(systemName: "ellipsis.circle").font(.system(size: 15)) }
+                .menuStyle(.borderlessButton).fixedSize().help("Меню программы")
+                .accessibilityLabel("Меню программы")
+            }
+            .font(.system(size: 11)).foregroundStyle(.secondary)
+            .padding(.horizontal, 20).padding(.vertical, 13)
+        }
+    }
+
+    private func acceptProviders(_ providers: [NSItemProvider]) -> Bool {
+        let supported = providers.filter { $0.hasItemConformingToTypeIdentifier("public.file-url") }
+        guard !supported.isEmpty else { return false }
+        let group = DispatchGroup()
+        let lock = NSLock()
+        var urls: [URL] = []
+        for provider in supported {
+            group.enter()
+            provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { item, _ in
+                defer { group.leave() }
+                let url: URL?
+                if let value = item as? URL { url = value }
+                else if let data = item as? Data { url = URL(dataRepresentation: data, relativeTo: nil) }
+                else { url = nil }
+                if let url { lock.lock(); urls.append(url); lock.unlock() }
+            }
+        }
+        group.notify(queue: .main) { store.accept(urls); store.dragActive = false }
+        return true
+    }
+}
+
+private struct HistoryRow: View {
+    let entry: ImportEntry
+    @ObservedObject var store: ImportStore
+
+    private var working: Bool {
+        entry.stage == .queued || entry.stage == .importing || store.updatingFavorites.contains(entry.id)
+    }
+    private var warning: Bool {
+        entry.stage == .failed || entry.stage == .needsReview || CloudState.isWarning(entry.cloudStatus)
+            || entry.favoriteError != nil || entry.isFavorite == false
+            || (entry.cloudUpdateError != nil && !CloudState.isReady(entry.cloudStatus))
+    }
+    private var subtitle: String {
+        if store.updatingFavorites.contains(entry.id) { return "Добавляем в избранное…" }
+        switch entry.stage {
+        case .queued: return "В очереди"
+        case .importing: return "Добавляем в медиатеку и избранное…"
+        case .failed: return "Не удалось добавить"
+        case .needsReview: return "Нужно проверить медиатеку"
+        case .imported:
+            return entry.cloudStatus == "missing" ? "Трек больше не найден в «Музыке»" : CloudState.label(entry.cloudStatus)
+        }
+    }
+    private var symbol: String {
+        if warning { return "exclamationmark.triangle" }
+        if CloudState.isReady(entry.cloudStatus) { return "checkmark.icloud" }
+        return "music.note"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 10) {
+                Group {
+                    if working { ProgressView().controlSize(.small) }
+                    else { Image(systemName: symbol).font(.system(size: 16, weight: .regular)) }
+                }
+                .foregroundStyle(warning ? Color.orange : accent)
+                .frame(width: 34, height: 36)
+                .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 9))
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 4) {
+                        Text(entry.title).font(.system(size: 12, weight: .medium)).lineLimit(1)
+                        if entry.isFavorite == true {
+                            Image(systemName: "star.fill").font(.system(size: 9)).foregroundStyle(accent)
+                                .accessibilityLabel("В избранном")
+                        }
+                    }
+                    Text(subtitle).font(.system(size: 10))
+                        .foregroundStyle(warning ? Color.orange : Color.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 0)
+                if entry.stage == .imported, entry.isFavorite != true, entry.trackID != nil {
+                    Button { store.markFavorite(entry) } label: { Image(systemName: "star") }
+                        .disabled(store.updatingFavorites.contains(entry.id))
+                        .buttonStyle(.borderless).help("Повторить добавление в избранное без импорта")
+                        .accessibilityLabel("Добавить \(entry.title) в избранное")
+                }
+                if entry.stage == .failed {
+                    Button { store.retry(entry) } label: { Image(systemName: "arrow.clockwise") }
+                        .buttonStyle(.borderless).help("Повторить импорт")
+                        .accessibilityLabel("Повторить импорт \(entry.title)")
+                } else if entry.stage == .imported || entry.stage == .needsReview {
+                    Button { store.openMusic(entry) } label: { Image(systemName: "arrow.up.right") }
+                        .buttonStyle(.borderless).help("Показать в «Музыке»")
+                        .accessibilityLabel("Показать \(entry.title) в «Музыке»")
+                }
+            }
+            if let error = entry.error {
+                Text(error).font(.system(size: 11)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true).padding(.leading, 44)
+            }
+            if let problem = entry.favoriteError {
+                Text(problem).font(.system(size: 11)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true).padding(.leading, 44)
+            }
+            if entry.stage == .imported, CloudState.canAutoRetry(entry.cloudStatus) {
+                if let problem = entry.cloudUpdateError {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(problem).font(.system(size: 11)).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        if problem.contains("Универсальный доступ") {
+                            Button("Разрешить обновление облака…") { CloudUpdateBridge.openPermissionSettings() }
+                        }
+                        Button("Повторить обновление облака") { store.requestCloudUpdate(for: [entry.id]) }
+                            .disabled(store.cloudUpdateInProgress)
+                    }
+                    .font(.system(size: 11)).buttonStyle(.borderless).padding(.leading, 44)
+                } else if entry.cloudUpdateRequestedAt != nil, entry.cloudRetryMessage == nil, CloudState.canAutoRetry(entry.cloudStatus) {
+                    Text("Обновление облака запрошено · ждём подтверждения загрузки")
+                        .font(.system(size: 10)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true).padding(.leading, 44)
+                }
+                if let message = entry.cloudRetryMessage {
+                    Text(message).font(.system(size: 10)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true).padding(.leading, 44)
+                }
+            }
+        }
+        .padding(.vertical, 10)
+        .contextMenu {
+            if entry.stage == .imported { Button("Показать в «Музыке»") { store.openMusic(entry) } }
+            if entry.stage == .imported, entry.trackID != nil {
+                Button("Обновить облачную медиатеку") { store.requestCloudUpdate(for: [entry.id]) }
+                    .disabled(store.cloudUpdateInProgress)
+                Button("Добавить в избранное") { store.markFavorite(entry) }
+                    .disabled(store.updatingFavorites.contains(entry.id))
+            }
+            if entry.stage == .failed { Button("Повторить") { store.retry(entry) } }
+            if let path = entry.managedPath {
+                Button("Показать копию файла в Finder") {
+                    NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+                }
+            }
+        }
+    }
+}
