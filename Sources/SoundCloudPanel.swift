@@ -2,8 +2,8 @@ import SwiftUI
 import AppKit
 
 struct SoundCloudPanel: View {
-    @ObservedObject var model: SoundCloudStore
-    @ObservedObject var imports: ImportStore
+    @Bindable var model: SoundCloudStore
+    var imports: ImportStore
 
     var body: some View {
         VStack(spacing: 12) {
@@ -54,7 +54,7 @@ struct SoundCloudPanel: View {
     }
 
     private func trackRow(_ track: SoundCloudTrack) -> some View {
-        let entry = imports.entries.first { $0.soundCloudID == track.id && $0.cloudStatus != "missing" }
+        let entry = imports.entry(soundCloudID: track.id)
         let working = entry?.stage == .queued || entry?.stage == .importing
         let added = entry?.stage == .imported
         return VStack(alignment: .leading, spacing: 7) {

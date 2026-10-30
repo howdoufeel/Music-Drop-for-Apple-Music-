@@ -5,7 +5,7 @@ enum ImportStage: String, Codable {
     case queued, importing, imported, failed, needsReview
 }
 
-struct ImportEntry: Codable, Identifiable {
+struct ImportEntry: Codable, Identifiable, Equatable {
     var id = UUID()
     var sourcePath: String
     var title: String
@@ -65,12 +65,20 @@ enum FileTools {
     }
 
     /// A persistent copy also protects tracks when Music's own copy setting is off.
-    static func preserve(_ source: URL, digest: String, directory: URL) throws -> URL {
+    /// `moving` is for Music Drop's own finished downloads: a rename is instant and nothing else writes them.
+    static func preserve(_ source: URL, digest: String, directory: URL, moving: Bool = false) throws -> URL {
         let fm = FileManager.default
         let trackDirectory = directory.appendingPathComponent(digest, isDirectory: true)
         try fm.createDirectory(at: trackDirectory, withIntermediateDirectories: true)
         let destination = trackDirectory.appendingPathComponent(source.lastPathComponent)
-        if fm.fileExists(atPath: destination.path) { return destination }
+        if fm.fileExists(atPath: destination.path) {
+            if moving { try? fm.removeItem(at: source) }
+            return destination
+        }
+        if moving {
+            try fm.moveItem(at: source, to: destination)
+            return destination
+        }
         let temporary = trackDirectory.appendingPathComponent(UUID().uuidString + ".partial")
         defer { try? fm.removeItem(at: temporary) }
         try fm.copyItem(at: source, to: temporary)

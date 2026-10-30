@@ -2,8 +2,9 @@ import SwiftUI
 import AppKit
 
 struct YouTubePanel: View {
-    @ObservedObject var model: YouTubeStore
-    @ObservedObject var imports: ImportStore
+    @Bindable var model: YouTubeStore
+    var imports: ImportStore
+    @AppStorage(YouTubeAudioFormat.defaultsKey) private var format: YouTubeAudioFormat = .m4a
 
     var body: some View {
         VStack(spacing: 12) {
@@ -16,7 +17,7 @@ struct YouTubePanel: View {
                     .disabled(model.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     .accessibilityLabel("Проверить ссылку YouTube")
             }.padding(.horizontal, 20)
-            if model.isSearching {
+            if model.isSearching, model.verifying.isEmpty {
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.small)
                     Text("Получаем сведения о видео…").font(.system(size: 12)).foregroundStyle(.secondary)
@@ -32,7 +33,7 @@ struct YouTubePanel: View {
                         VStack(spacing: 10) {
                             Image(systemName: "play.rectangle").font(.system(size: 34, weight: .light)).foregroundStyle(.red)
                             Text("Трек с YouTube — в медиатеку").font(.system(size: 16, weight: .semibold))
-                            Text("Вставь ссылку на одно видео. Сохраним MP3 и добавим в Apple Music и избранное.")
+                            Text("Вставь ссылку на одно видео. Сохраним аудио и добавим в Apple Music и избранное.")
                                 .font(.system(size: 12)).foregroundStyle(.secondary).multilineTextAlignment(.center)
                         }.frame(maxWidth: .infinity).padding(.vertical, 45)
                     }
@@ -42,24 +43,38 @@ struct YouTubePanel: View {
             Text("Без входа и данных браузера. При отказе YouTube используется резервный сервис Invidious.")
                 .font(.system(size: 10)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 20)
-            Text("MP3 сохраняется на Mac. Закрытые, платные и недоступные видео загрузить не получится.")
+            Text("\(format.label) сохраняется на Mac, формат меняется в настройках. Закрытые, платные и недоступные видео загрузить не получится.")
                 .font(.system(size: 10)).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 20).padding(.bottom, 10)
         }
     }
 
     private func row(_ track: YouTubeTrack) -> some View {
-        let entry = imports.entries.first { $0.youtubeID == track.id && $0.cloudStatus != "missing" }
+        let entry = imports.entry(youTubeID: track.id)
         return VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .top, spacing: 10) {
-                Image(systemName: "play.rectangle.fill").font(.system(size: 22)).foregroundStyle(.red)
-                    .frame(width: 44, height: 44).background(.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 9))
+                AsyncImage(url: URL(string: "https://i.ytimg.com/vi/\(track.id)/mqdefault.jpg")) { image in
+                    image.resizable().scaledToFill()
+                } placeholder: {
+                    Image(systemName: "play.rectangle.fill").font(.system(size: 22)).foregroundStyle(.red)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity).background(.red.opacity(0.08))
+                }
+                .frame(width: 44, height: 44).clipShape(RoundedRectangle(cornerRadius: 9))
                 VStack(alignment: .leading, spacing: 5) {
                     Text(track.title).font(.system(size: 13, weight: .medium)).lineLimit(3)
                     Text(track.artist).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(2)
-                    Text((track.fallbackEndpoint == nil ? "YouTube · MP3" : "YouTube · MP3 · резервный сервис") + (track.durationLabel.isEmpty ? "" : " · " + track.durationLabel))
+                    Text("YouTube · \(format.label)" + (track.fallbackEndpoint == nil ? "" : " · резервный сервис") + (track.durationLabel.isEmpty ? "" : " · " + track.durationLabel))
                         .font(.system(size: 10)).foregroundStyle(.secondary)
                 }
+            }
+            if model.verifying.contains(track.id), model.downloadStates[track.id] == nil, entry == nil {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.mini)
+                    Text("Проверяем доступность аудио…").font(.system(size: 10)).foregroundStyle(.secondary)
+                }
+            } else if model.prefetchedIDs.contains(track.id), entry == nil {
+                Label("Аудио уже скачано — добавится сразу", systemImage: "bolt.fill")
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
             }
             if let state = model.downloadStates[track.id] {
                 HStack {

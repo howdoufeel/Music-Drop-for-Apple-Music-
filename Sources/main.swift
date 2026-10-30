@@ -62,6 +62,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         youtube = YouTubeStore(preview: preview)
         youtube.onReady = { [weak self] file, track in self?.store.acceptYouTube(file, track: track) }
         youtube.onActivity = { [weak self] in self?.updateActivity() }
+        youtube.shouldPrefetch = { [weak self] track in self?.store.entry(youTubeID: track.id) == nil }
         soundCloud.onReady = { [weak self] file, track in self?.store.acceptSoundCloud(file, track: track) }
         soundCloud.onActivity = { [weak self] in self?.updateActivity() }
         statusItem = NSStatusBar.system.statusItem(withLength: 30)
@@ -84,11 +85,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             button.addSubview(target)
         }
         store.onActivity = { [weak self] _ in self?.updateActivity() }
-        popover.contentSize = NSSize(width: 380, height: 540)
         popover.behavior = .transient
         popover.animates = !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         popover.delegate = self
-        popover.contentViewController = NSHostingController(rootView: DropPanel(store: store, soundCloud: soundCloud, youtube: youtube))
         localMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
             guard let self else { return event }
             if event.type == .keyDown, event.keyCode == 53 { self.popover.performClose(nil) }
@@ -130,9 +129,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard let button = statusItem.button else { return }
         if activate { NSApp.activate(ignoringOtherApps: true) }
         guard !popover.isShown else { return }
+        // Built on demand, so a hidden popover never re-renders alongside the main window.
+        if popover.contentViewController == nil {
+            popover.contentSize = NSSize(width: 380, height: 540)
+            popover.contentViewController = NSHostingController(rootView: DropPanel(store: store, soundCloud: soundCloud, youtube: youtube))
+        }
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         if activate { popover.contentViewController?.view.window?.makeKeyAndOrderFront(nil) }
         store.refreshCloud()
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        popover.contentViewController = nil
     }
 
     func toggle() {
@@ -184,6 +192,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         soundCloud.cancelAll()
         youtube.cancelAll()
+        store.flushHistory()
         if let globalMonitor { NSEvent.removeMonitor(globalMonitor) }
         if let localMonitor { NSEvent.removeMonitor(localMonitor) }
     }

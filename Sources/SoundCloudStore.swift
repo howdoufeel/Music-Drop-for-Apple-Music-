@@ -1,14 +1,14 @@
 import Foundation
-import SwiftUI
+import Observation
 
-final class SoundCloudStore: ObservableObject {
-    @Published var query = ""
-    @Published var results: [SoundCloudTrack] = []
-    @Published var isSearching = false
-    @Published var didSearch = false
-    @Published var error: String?
-    @Published var downloadStates: [String: String] = [:]
-    @Published var downloadErrors: [String: String] = [:]
+@Observable final class SoundCloudStore {
+    var query = ""
+    var results: [SoundCloudTrack] = []
+    var isSearching = false
+    var didSearch = false
+    var error: String?
+    var downloadStates: [String: String] = [:]
+    var downloadErrors: [String: String] = [:]
     private let service: SoundCloudProviding
     private let searchQueue = DispatchQueue(label: "tech.musicdrop.soundcloud.search", qos: .userInitiated, attributes: .concurrent)
     private let downloadQueue: OperationQueue = {
@@ -18,13 +18,13 @@ final class SoundCloudStore: ObservableObject {
         queue.maxConcurrentOperationCount = 2
         return queue
     }()
-    private var searchToken: SoundCloudCancellation?
-    private var activeSearchInput: String?
-    private var downloadTokens: [String: SoundCloudCancellation] = [:]
+    @ObservationIgnored private var searchToken: SoundCloudCancellation?
+    @ObservationIgnored private var activeSearchInput: String?
+    @ObservationIgnored private var downloadTokens: [String: SoundCloudCancellation] = [:]
     private let preview: Bool
     let directory: URL
-    var onReady: ((URL, SoundCloudTrack) -> Void)?
-    var onActivity: (() -> Void)?
+    @ObservationIgnored var onReady: ((URL, SoundCloudTrack) -> Void)?
+    @ObservationIgnored var onActivity: (() -> Void)?
     var isDownloading: Bool { !downloadStates.isEmpty }
 
     init(service: SoundCloudProviding = SoundCloudService(), directory: URL? = nil, preview: Bool = false) {

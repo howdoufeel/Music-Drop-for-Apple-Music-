@@ -1,8 +1,7 @@
 import AppKit
-import SwiftUI
 import AVFoundation
+import Observation
 import ServiceManagement
-import ApplicationServices
 
 struct ImportServices {
     var playable: (URL) throws -> Bool = { url in
@@ -27,42 +26,70 @@ struct ImportServices {
     var musicIsRunning: () -> Bool = { !NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.Music").isEmpty }
 }
 
-final class ImportStore: ObservableObject {
-    @Published var entries: [ImportEntry] = []
-    @Published var notice: String?
-    @Published var dragActive = false
-    @Published var settingsVisible = false
-    @Published var loginEnabled = SMAppService.mainApp.status == .enabled
-    @Published var refreshInProgress = false
-    @Published var lastRefresh: Date?
-    @Published var updatingFavorites: Set<UUID> = []
-    @Published var cloudUpdateInProgress = false
+/// Coalesces history writes off the main thread; the newest snapshot always wins.
+private final class HistoryWriter {
+    static let queue = DispatchQueue(label: "tech.musicdrop.history", qos: .utility)
+    private let lock = NSLock()
+    private var pending: [ImportEntry]?
+
+    func submit(_ entries: [ImportEntry], to url: URL, failed: @escaping (Error) -> Void) {
+        lock.lock(); let idle = pending == nil; pending = entries; lock.unlock()
+        guard idle else { return }
+        Self.queue.async {
+            self.lock.lock(); let snapshot = self.pending; self.pending = nil; self.lock.unlock()
+            guard let snapshot else { return }
+            do {
+                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try JSONEncoder().encode(snapshot).write(to: url, options: .atomic)
+            } catch {
+                DispatchQueue.main.async { failed(error) }
+            }
+        }
+    }
+
+    /// Waits for every scheduled write, from any store.
+    static func flush() { queue.sync {} }
+}
+
+@Observable final class ImportStore {
+    var entries: [ImportEntry] = []
+    var notice: String?
+    var dragActive = false
+    var settingsVisible = false
+    var loginEnabled = SMAppService.mainApp.status == .enabled
+    var refreshInProgress = false
+    var lastRefresh: Date?
+    var updatingFavorites: Set<UUID> = []
+    var cloudUpdateInProgress = false
+    // Derived from entries once per change, so views and timers never rescan the history.
+    private(set) var activeImportCount = 0
+    private(set) var successfulCount = 0
+    private(set) var cloudWaitingCount = 0
+    private(set) var hasAutomationError = false
+    private(set) var needsCloudPermission = false
+    private(set) var soundCloudEntries: [String: ImportEntry] = [:]
+    private(set) var youTubeEntries: [String: ImportEntry] = [:]
 
     let directory: URL
     private let queue = DispatchQueue(label: "tech.musicdrop.import", qos: .userInitiated)
-    private var timer: Timer?
+    private let cloudQueue = DispatchQueue(label: "tech.musicdrop.cloud", qos: .utility)
+    private let writer = HistoryWriter()
+    @ObservationIgnored private var timer: Timer?
     private let preview: Bool
     private let services: ImportServices
     private let automaticMonitoring: Bool
-    private var pendingCloudUpdateIDs: Set<UUID> = []
+    @ObservationIgnored private var pendingCloudUpdateIDs: Set<UUID> = []
     private let now: () -> Date
-    private var cloudPollOffset = 0
-    var onActivity: ((Bool) -> Void)?
+    @ObservationIgnored private var cloudPollOffset = 0
+    @ObservationIgnored var onActivity: ((Bool) -> Void)?
 
     var activeCount: Int {
-        entries.filter { $0.stage == .queued || $0.stage == .importing }.count
-            + updatingFavorites.count + (cloudUpdateInProgress ? 1 : 0)
+        activeImportCount + updatingFavorites.count + (cloudUpdateInProgress ? 1 : 0)
     }
-    var needsCloudPermission: Bool {
-        entries.contains { CloudState.canAutoRetry($0.cloudStatus) && $0.cloudUpdateError?.contains("Универсальный доступ") == true }
-    }
-    var successfulCount: Int { entries.filter { $0.stage == .imported }.count }
-    var cloudWaitingCount: Int {
-        entries.filter { $0.stage == .imported && $0.cloudSyncPending == true && CloudState.canAutoRetry($0.cloudStatus) }.count
-    }
-    var hasAutomationError: Bool { entries.contains {
-        $0.error?.contains("Автоматизация") == true || $0.favoriteError?.contains("Автоматизация") == true
-    } }
+    /// Newest entry for a source track, ignoring ones removed from Music.
+    func entry(soundCloudID id: String) -> ImportEntry? { soundCloudEntries[id] }
+    func entry(youTubeID id: String) -> ImportEntry? { youTubeEntries[id] }
+    private var downloadsDirectory: URL { directory.appendingPathComponent("Downloads", isDirectory: true) }
 
     init(directory: URL? = nil, preview: Bool = false, services: ImportServices = .init(), startTimer: Bool = true,
          now: @escaping () -> Date = Date.init) {
@@ -78,9 +105,11 @@ final class ImportStore: ObservableObject {
                 ImportEntry(sourcePath: "", title: "Новая запись", stage: .imported, cloudStatus: "not uploaded", isFavorite: true,
                             cloudUpdateError: CloudUpdateError.accessibilityRequired.localizedDescription)
             ]
+            reindex()
             return
         }
         load()
+        reindex()
         if startTimer {
             timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in self?.cloudSyncTick() }
             if cloudWaitingCount > 0 { DispatchQueue.main.async { [weak self] in self?.cloudSyncTick() } }
@@ -92,33 +121,36 @@ final class ImportStore: ObservableObject {
     deinit { timer?.invalidate() }
 
     private func load() {
+        // Another store in this process may still be writing the same history.
+        HistoryWriter.flush()
         guard FileManager.default.fileExists(atPath: historyURL.path) else { return }
         do {
-            entries = try JSONDecoder().decode([ImportEntry].self, from: Data(contentsOf: historyURL))
-            for index in entries.indices {
-                if entries[index].stage == .importing {
-                    entries[index].stage = .needsReview
-                    entries[index].error = "Программа закрылась во время импорта. Проверь «Музыку»: трек мог уже добавиться."
-                } else if entries[index].stage == .queued {
-                    entries[index].stage = .failed
-                    entries[index].error = "Импорт не начался до закрытия программы. Можно повторить."
+            var loaded = try JSONDecoder().decode([ImportEntry].self, from: Data(contentsOf: historyURL))
+            for index in loaded.indices {
+                if loaded[index].stage == .importing {
+                    loaded[index].stage = .needsReview
+                    loaded[index].error = "Программа закрылась во время импорта. Проверь «Музыку»: трек мог уже добавиться."
+                } else if loaded[index].stage == .queued {
+                    loaded[index].stage = .failed
+                    loaded[index].error = "Импорт не начался до закрытия программы. Можно повторить."
                 }
                 // Older releases stopped after one request; resume only unfinished audio uploads.
-                if entries[index].stage == .imported, entries[index].trackID != nil,
-                   entries[index].cloudSyncPending == nil, CloudState.canAutoRetry(entries[index].cloudStatus) {
-                    entries[index].cloudSyncPending = true
-                    entries[index].cloudRetryAt = now()
-                    entries[index].cloudPermissionBlocked = entries[index].cloudUpdateError?.contains("Универсальный доступ") == true
+                if loaded[index].stage == .imported, loaded[index].trackID != nil,
+                   loaded[index].cloudSyncPending == nil, CloudState.canAutoRetry(loaded[index].cloudStatus) {
+                    loaded[index].cloudSyncPending = true
+                    loaded[index].cloudRetryAt = now()
+                    loaded[index].cloudPermissionBlocked = loaded[index].cloudUpdateError?.contains("Универсальный доступ") == true
                 }
-                if entries[index].cloudSyncPending == true, entries[index].cloudPermissionBlocked == true {
-                    entries[index].cloudUpdateError = CloudUpdateError.accessibilityRequired.localizedDescription
+                if loaded[index].cloudSyncPending == true, loaded[index].cloudPermissionBlocked == true {
+                    loaded[index].cloudUpdateError = CloudUpdateError.accessibilityRequired.localizedDescription
                 }
-                if entries[index].stage == .imported, !CloudState.canAutoRetry(entries[index].cloudStatus),
-                   entries[index].cloudPermissionBlocked == true || entries[index].cloudUpdateError?.contains("Универсальный доступ") == true {
-                    entries[index].cloudPermissionBlocked = false
-                    entries[index].cloudUpdateError = nil
+                if loaded[index].stage == .imported, !CloudState.canAutoRetry(loaded[index].cloudStatus),
+                   loaded[index].cloudPermissionBlocked == true || loaded[index].cloudUpdateError?.contains("Универсальный доступ") == true {
+                    loaded[index].cloudPermissionBlocked = false
+                    loaded[index].cloudUpdateError = nil
                 }
             }
+            entries = loaded
             save()
         } catch {
             let backup = directory.appendingPathComponent("history-unreadable-\(Int(Date().timeIntervalSince1970)).json")
@@ -131,16 +163,46 @@ final class ImportStore: ObservableObject {
         }
     }
 
+    /// Every change to entries ends here: derived state is refreshed, then the main thread
+    /// only hands over a snapshot; encoding and disk writes happen in the background.
     private func save() {
+        reindex()
         guard !preview else { return }
-        do {
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            let data = try JSONEncoder().encode(entries)
-            try data.write(to: historyURL, options: .atomic)
-        } catch {
-            notice = "Не удалось сохранить историю: \(error.localizedDescription)"
+        writer.submit(entries, to: historyURL) { [weak self] error in
+            self?.notice = "Не удалось сохранить историю: \(error.localizedDescription)"
         }
         onActivity?(activeCount > 0)
+    }
+
+    /// Writes pending history before the app quits.
+    func flushHistory() { HistoryWriter.flush() }
+
+    private func reindex() {
+        var active = 0, successful = 0, waiting = 0
+        var automation = false, permission = false
+        var bySoundCloud: [String: ImportEntry] = [:], byYouTube: [String: ImportEntry] = [:]
+        for entry in entries {
+            switch entry.stage {
+            case .queued, .importing: active += 1
+            case .imported: successful += 1
+            case .failed, .needsReview: break
+            }
+            let retryable = CloudState.canAutoRetry(entry.cloudStatus)
+            if entry.stage == .imported, entry.cloudSyncPending == true, retryable { waiting += 1 }
+            if entry.error?.contains("Автоматизация") == true || entry.favoriteError?.contains("Автоматизация") == true { automation = true }
+            if retryable, entry.cloudUpdateError?.contains("Универсальный доступ") == true { permission = true }
+            guard entry.cloudStatus != "missing" else { continue }
+            if let id = entry.soundCloudID, bySoundCloud[id] == nil { bySoundCloud[id] = entry }
+            if let id = entry.youtubeID, byYouTube[id] == nil { byYouTube[id] = entry }
+        }
+        // Assign only real changes so unrelated views are not invalidated.
+        if activeImportCount != active { activeImportCount = active }
+        if successfulCount != successful { successfulCount = successful }
+        if cloudWaitingCount != waiting { cloudWaitingCount = waiting }
+        if hasAutomationError != automation { hasAutomationError = automation }
+        if needsCloudPermission != permission { needsCloudPermission = permission }
+        if soundCloudEntries != bySoundCloud { soundCloudEntries = bySoundCloud }
+        if youTubeEntries != byYouTube { youTubeEntries = byYouTube }
     }
 
     func accept(_ urls: [URL]) {
@@ -227,6 +289,33 @@ final class ImportStore: ObservableObject {
         save()
     }
 
+    /// Applies one change to many entries with a single reindex and save.
+    private func updateAll(_ ids: Set<UUID>, _ action: (inout ImportEntry) -> Void) {
+        guard !ids.isEmpty else { return }
+        var changed = entries
+        for index in changed.indices where ids.contains(changed[index].id) { action(&changed[index]) }
+        entries = changed
+        save()
+    }
+
+    private func isOwnDownload(_ url: URL) -> Bool {
+        url.standardizedFileURL.path.hasPrefix(downloadsDirectory.standardizedFileURL.path + "/")
+    }
+
+    /// Removes a finished download's empty staging folders, keeping each source's own folder.
+    private func cleanStaging(of source: URL, removingFile: Bool) {
+        let fm = FileManager.default
+        if removingFile { try? fm.removeItem(at: source) }
+        let root = downloadsDirectory.standardizedFileURL.path
+        var folder = source.deletingLastPathComponent()
+        while folder.standardizedFileURL.path.hasPrefix(root + "/"),
+              folder.deletingLastPathComponent().standardizedFileURL.path != root,
+              (try? fm.contentsOfDirectory(atPath: folder.path))?.isEmpty == true {
+            try? fm.removeItem(at: folder)
+            folder = folder.deletingLastPathComponent()
+        }
+    }
+
     private func performImport(_ entry: ImportEntry) {
         queue.async { [weak self] in
             guard let self else { return }
@@ -235,7 +324,10 @@ final class ImportStore: ObservableObject {
             let access = source.startAccessingSecurityScopedResource()
             defer { if access { source.stopAccessingSecurityScopedResource() } }
             do {
-                try FileTools.validate(source, allowedExtensions: entry.soundCloudID == nil ? ["mp3"] : ["mp3", "m4a"])
+                let downloaded = entry.soundCloudID != nil || entry.youtubeID != nil
+                // Music Drop's own finished downloads are moved, not copied and hashed twice.
+                let ownDownload = downloaded && entry.managedPath == nil && self.isOwnDownload(source)
+                try FileTools.validate(source, allowedExtensions: downloaded ? ["mp3", "m4a"] : ["mp3"])
                 guard try self.services.playable(source) else {
                     throw DropError.message("Не удалось прочитать аудио. Проверь, что MP3 не повреждён и полностью загружен.")
                 }
@@ -246,6 +338,7 @@ final class ImportStore: ObservableObject {
                         (($0.stage == .imported && $0.cloudStatus != "missing") || $0.stage == .needsReview) }
                 }
                 if let existing {
+                    if ownDownload { self.cleanStaging(of: source, removingFile: true) }
                     DispatchQueue.main.async {
                         self.entries.removeAll { $0.id == entry.id }
                         self.notice = existing.stage == .needsReview
@@ -254,12 +347,15 @@ final class ImportStore: ObservableObject {
                         self.save()
                         if existing.stage == .imported {
                             self.markFavorite(existing)
+                        } else {
+                            self.beginCloudUpdate()
                         }
                     }
                     return
                 }
                 let managed = try FileTools.preserve(source, digest: digest,
-                                                     directory: self.directory.appendingPathComponent("Media"))
+                                                     directory: self.directory.appendingPathComponent("Media"), moving: ownDownload)
+                if ownDownload { self.cleanStaging(of: source, removingFile: false) }
                 DispatchQueue.main.sync {
                     self.update(entry.id) { $0.digest = digest; $0.managedPath = managed.path }
                 }
@@ -278,38 +374,37 @@ final class ImportStore: ObservableObject {
                         $0.stage = (error as? AutomationError)?.code == -1712 ? .needsReview : .failed
                         $0.error = error.localizedDescription
                     }
+                    // Earlier tracks of the batch may still be waiting for their cloud request.
+                    self.beginCloudUpdate()
                 }
             }
         }
     }
 
-    /// Queued behind imports; one menu request covers every completed import in a batch.
+    /// Waits for queued imports; one menu request covers every completed import in a batch.
     func requestCloudUpdate(for ids: [UUID]? = nil) {
         guard !preview else { return }
-        let candidates = ids ?? entries.filter { $0.stage == .imported }.map(\.id)
-        for id in candidates where entries.contains(where: { $0.id == id && $0.stage == .imported }) {
-            pendingCloudUpdateIDs.insert(id)
-            update(id) {
-                $0.cloudSyncPending = true
-                $0.cloudRetryCount = 0
-                $0.cloudRetryAt = nil
-                $0.cloudPermissionBlocked = false
-            }
+        let imported = Set(entries.lazy.filter { $0.stage == .imported }.map(\.id))
+        let candidates = ids.map { Set($0).intersection(imported) } ?? imported
+        pendingCloudUpdateIDs.formUnion(candidates)
+        updateAll(candidates) {
+            $0.cloudSyncPending = true
+            $0.cloudRetryCount = 0
+            $0.cloudRetryAt = nil
+            $0.cloudPermissionBlocked = false
         }
         beginCloudUpdate()
     }
 
+    /// The helper runs on its own queue, so a slow menu request never delays the next import.
     private func beginCloudUpdate() {
-        guard !pendingCloudUpdateIDs.isEmpty, !cloudUpdateInProgress else { return }
+        guard !pendingCloudUpdateIDs.isEmpty, !cloudUpdateInProgress, activeImportCount == 0 else { return }
         cloudUpdateInProgress = true
         onActivity?(true)
-        queue.async { [weak self] in
+        let affected = pendingCloudUpdateIDs
+        pendingCloudUpdateIDs.removeAll()
+        cloudQueue.async { [weak self] in
             guard let self else { return }
-            var affected: Set<UUID> = []
-            DispatchQueue.main.sync {
-                affected = self.pendingCloudUpdateIDs
-                self.pendingCloudUpdateIDs.removeAll()
-            }
             var problem: String?
             var permissionBlocked = false
             do { try self.services.updateCloudLibrary() }
@@ -320,17 +415,15 @@ final class ImportStore: ObservableObject {
             let attemptedAt = self.now()
             DispatchQueue.main.async {
                 self.cloudUpdateInProgress = false
-                for id in affected {
-                    self.update(id) {
-                        if problem == nil { $0.cloudUpdateRequestedAt = attemptedAt }
-                        $0.cloudUpdateError = problem
-                        $0.cloudPermissionBlocked = permissionBlocked
-                        let attempt = min(100, ($0.cloudRetryCount ?? 0) + 1)
-                        $0.cloudRetryCount = attempt
-                        $0.cloudSyncPending = CloudState.canAutoRetry($0.cloudStatus)
-                        $0.cloudRetryAt = $0.cloudSyncPending == true
-                            ? attemptedAt.addingTimeInterval(CloudState.retryDelay(attempt: attempt, commandAccepted: problem == nil)) : nil
-                    }
+                self.updateAll(affected) {
+                    if problem == nil { $0.cloudUpdateRequestedAt = attemptedAt }
+                    $0.cloudUpdateError = problem
+                    $0.cloudPermissionBlocked = permissionBlocked
+                    let attempt = min(100, ($0.cloudRetryCount ?? 0) + 1)
+                    $0.cloudRetryCount = attempt
+                    $0.cloudSyncPending = CloudState.canAutoRetry($0.cloudStatus)
+                    $0.cloudRetryAt = $0.cloudSyncPending == true
+                        ? attemptedAt.addingTimeInterval(CloudState.retryDelay(attempt: attempt, commandAccepted: problem == nil)) : nil
                 }
                 if !self.pendingCloudUpdateIDs.isEmpty {
                     self.beginCloudUpdate()
@@ -389,16 +482,15 @@ final class ImportStore: ObservableObject {
                 catch { failure = error.localizedDescription; break }
             }
             DispatchQueue.main.async {
-                for (id, status) in updates {
-                    self.update(id) {
-                        $0.cloudStatus = status
-                        if !CloudState.canAutoRetry(status) {
-                            $0.cloudSyncPending = false
-                            $0.cloudRetryAt = nil
-                            if CloudState.isReady(status) {
-                                $0.cloudUpdateError = nil
-                                $0.cloudPermissionBlocked = false
-                            }
+                self.updateAll(Set(updates.keys)) {
+                    guard let status = updates[$0.id] else { return }
+                    $0.cloudStatus = status
+                    if !CloudState.canAutoRetry(status) {
+                        $0.cloudSyncPending = false
+                        $0.cloudRetryAt = nil
+                        if CloudState.isReady(status) {
+                            $0.cloudUpdateError = nil
+                            $0.cloudPermissionBlocked = false
                         }
                     }
                 }

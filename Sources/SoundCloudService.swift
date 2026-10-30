@@ -176,6 +176,11 @@ final class SoundCloudService: SoundCloudProviding {
             if let stream = try searchClient.audioStream(for: track, cancellation: cancellation) {
                 let prepared = try preparedURL(for: track, working: working, fileExtension: stream.fileExtension)
                 stage("Скачиваем с SoundCloud…")
+                if stream.isHLS, try nativeHLS(stream, track: track, working: working, prepared: prepared,
+                                               ffmpeg: ffmpeg, cancellation: cancellation, stage: stage) {
+                    success = true
+                    return prepared
+                }
                 _ = try run(ffmpeg, arguments: Self.nativeDownloadArguments(stream: stream, track: track, output: prepared),
                             cancellation: cancellation, timeout: 900)
                 try validatePrepared(prepared)
@@ -222,6 +227,45 @@ final class SoundCloudService: SoundCloudProviding {
         try? FileManager.default.removeItem(at: audio)
         success = true
         return prepared
+    }
+
+    /// Joins the segments locally, then only rewraps them, so no audio is re-encoded.
+    /// Returns false when FFmpeg should stream the playlist itself instead.
+    private func nativeHLS(_ stream: SoundCloudAudioSource, track: SoundCloudTrack, working: URL, prepared: URL,
+                           ffmpeg: URL, cancellation: SoundCloudCancellation, stage: @escaping (String) -> Void) throws -> Bool {
+        let joined = working.appendingPathComponent("stream.hls")
+        defer { try? FileManager.default.removeItem(at: joined) }
+        var reported = -1
+        let lock = NSLock()
+        do {
+            try searchClient.downloadHLS(stream.url, to: joined, cancellation: cancellation) { done, total in
+                let percent = done * 100 / max(1, total)
+                // Under the lock, so parts finishing together never report percentages out of order.
+                lock.lock(); defer { lock.unlock() }
+                guard percent / 5 != reported / 5 else { return }
+                reported = percent
+                stage("Скачиваем с SoundCloud… \(percent)%")
+            }
+            if cancellation.isCancelled { throw SoundCloudError.cancelled }
+            _ = try run(ffmpeg, arguments: Self.localPrepareArguments(input: joined, track: track, output: prepared),
+                        cancellation: cancellation, timeout: 300)
+            try validatePrepared(prepared)
+            if cancellation.isCancelled { throw SoundCloudError.cancelled }
+            return true
+        } catch SoundCloudError.rateLimited {
+            throw SoundCloudError.rateLimited
+        } catch {
+            if cancellation.isCancelled { throw SoundCloudError.cancelled }
+            try? FileManager.default.removeItem(at: prepared)
+            return false
+        }
+    }
+
+    static func localPrepareArguments(input: URL, track: SoundCloudTrack, output: URL) -> [String] {
+        ["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-protocol_whitelist", "file", "-i", input.path,
+         "-map", "0:a:0", "-vn", "-c:a", "copy", "-fs", "200000001",
+         "-metadata", "title=" + track.title, "-metadata", "artist=" + track.artist,
+         "-metadata", "album=SoundCloud", "-metadata", "comment=" + track.url.absoluteString, output.path]
     }
 
     static func nativeDownloadArguments(stream: SoundCloudAudioSource, track: SoundCloudTrack, output: URL) -> [String] {

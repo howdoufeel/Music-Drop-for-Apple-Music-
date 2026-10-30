@@ -4,10 +4,11 @@ import AppKit
 private let accent = Color(nsColor: .systemPink)
 
 struct DropPanel: View {
-    @ObservedObject var store: ImportStore
-    @ObservedObject var soundCloud: SoundCloudStore
-    @ObservedObject var youtube: YouTubeStore
+    var store: ImportStore
+    var soundCloud: SoundCloudStore
+    var youtube: YouTubeStore
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @AppStorage(YouTubeAudioFormat.defaultsKey) private var youtubeFormat: YouTubeAudioFormat = .m4a
     @State private var fileTargeted = false
     @State private var selectedTab = 0
 
@@ -163,6 +164,11 @@ struct DropPanel: View {
             Text("Чтобы треки появились на других устройствах, включи «Синхронизацию медиатеки» в настройках «Музыки».")
                 .font(.system(size: 11)).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+            Picker("Формат YouTube", selection: $youtubeFormat) {
+                Text("M4A · быстро, без перекодирования").tag(YouTubeAudioFormat.m4a)
+                Text("MP3 · для старых плееров").tag(YouTubeAudioFormat.mp3)
+            }
+            .pickerStyle(.menu).controlSize(.small).font(.system(size: 12))
             HStack {
                 Button("Открыть «Музыку»") { store.openMusic() }
                 Spacer()
@@ -240,7 +246,7 @@ struct DropPanel: View {
 
 private struct HistoryRow: View {
     let entry: ImportEntry
-    @ObservedObject var store: ImportStore
+    let store: ImportStore
 
     private var working: Bool {
         entry.stage == .queued || entry.stage == .importing || store.updatingFavorites.contains(entry.id)

@@ -22,27 +22,29 @@ final class YouTubeFallback {
                                         destination: destination, endpoint: endpoint)
         }
     }
-    func resolve(_ id: String, cancellation: SoundCloudCancellation, refresh: Bool = false) throws -> YouTubeFallbackInfo {
+    func resolve(_ id: String, cancellation: SoundCloudCancellation, refresh: Bool = false,
+                 preferAAC: Bool = false) throws -> YouTubeFallbackInfo {
         _ = try YouTubeService.videoID("https://youtu.be/" + id)
         if cancellation.isCancelled { throw SoundCloudError.cancelled }
-        lock.lock(); let old = cache[id]; lock.unlock()
+        let key = preferAAC ? id + "|aac" : id
+        lock.lock(); let old = cache[key]; lock.unlock()
         if !refresh, let old, Date().timeIntervalSince(old.0) < 180 { return old.1 }
         var components = URLComponents(url: endpoint.appendingPathComponent("api/v1/videos/" + id), resolvingAgainstBaseURL: false)!
         components.queryItems = [URLQueryItem(name: "local", value: "true"),
             URLQueryItem(name: "fields", value: "videoId,title,author,lengthSeconds,liveNow,isUpcoming,isPostLiveDvr,paid,premium,adaptiveFormats,error")]
         let data = try transport(Self.request(components.url!), cancellation, 2_000_000, nil)
-        let info = try Self.parse(data, expectedID: id, endpoint: endpoint)
+        let info = try Self.parse(data, expectedID: id, endpoint: endpoint, preferAAC: preferAAC)
         if cancellation.isCancelled { throw SoundCloudError.cancelled }
         lock.lock()
         cache = cache.filter { Date().timeIntervalSince($0.value.0) < 180 }
         if cache.count >= 30, let key = cache.min(by: { $0.value.0 < $1.value.0 })?.key { cache[key] = nil }
-        cache[id] = (Date(), info); lock.unlock()
+        cache[key] = (Date(), info); lock.unlock()
         return info
     }
     func download(_ id: String, directory: URL, cancellation: SoundCloudCancellation,
-                  stage: @escaping (String) -> Void) throws -> URL {
+                  stage: @escaping (String) -> Void, preferAAC: Bool = false) throws -> URL {
         for attempt in 0...2 {
-            let info = try resolve(id, cancellation: cancellation, refresh: attempt > 0)
+            let info = try resolve(id, cancellation: cancellation, refresh: attempt > 0, preferAAC: preferAAC)
             let source = directory.appendingPathComponent("audio." + info.fileExtension)
             do {
                 stage("Скачиваем аудио через резервный сервис…")
@@ -77,7 +79,8 @@ final class YouTubeFallback {
         if media && endpoint.host?.lowercased() == "yt.chocolatemoo53.com", host.hasSuffix(".chocolatemoo53.com") { return true }
         return media && host.hasSuffix(".googlevideo.com")
     }
-    static func parse(_ data: Data, expectedID: String, endpoint: URL) throws -> YouTubeFallbackInfo {
+    /// With preferAAC an MP4 audio stream wins, so M4A output needs no re-encoding.
+    static func parse(_ data: Data, expectedID: String, endpoint: URL, preferAAC: Bool = false) throws -> YouTubeFallbackInfo {
         guard data.count <= 2_000_000,
               let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               root["videoId"] as? String == expectedID,
@@ -102,7 +105,8 @@ final class YouTubeFallback {
             let bitrate = (item["bitrate"] as? String).flatMap(Int.init) ?? (item["bitrate"] as? Int) ?? 0
             candidates.append((url, ext, min(1_000_000, max(0, bitrate))))
         }
-        guard let best = candidates.max(by: { $0.2 < $1.2 }) else {
+        let aac = candidates.filter { $0.1 == "m4a" }
+        guard let best = (preferAAC && !aac.isEmpty ? aac : candidates).max(by: { $0.2 < $1.2 }) else {
             throw DropError.message("Резервный сервис не предоставил доступный аудиопоток.")
         }
         func clean(_ text: String) -> String {

@@ -212,6 +212,55 @@ settle(store)
 expect(cloudRequests == beforeBatchRequests + 1, "multiple queued imports coalesce into one cloud update")
 expect(store.entries.prefix(3).allSatisfy { $0.cloudUpdateRequestedAt != nil },
        "every track in a batch receives its cloud request receipt")
+expect(FileManager.default.fileExists(atPath: batch[0].path), "a user's own MP3 is copied, never moved")
+
+// A slow menu request runs beside imports instead of in front of them.
+do {
+    let cloudGate = DispatchSemaphore(value: 0)
+    let startedLock = NSLock()
+    var slowCloudStarted = false
+    var slowServices = services
+    slowServices.updateCloudLibrary = {
+        startedLock.lock(); slowCloudStarted = true; startedLock.unlock()
+        _ = cloudGate.wait(timeout: .now() + 5)
+    }
+    let slowStore = ImportStore(directory: root.appendingPathComponent("SlowCloud"), services: slowServices, startTimer: false)
+    let firstSlow = root.appendingPathComponent("slow-first.mp3"), secondSlow = root.appendingPathComponent("slow-second.mp3")
+    try Data("slow-first".utf8).write(to: firstSlow); try Data("slow-second".utf8).write(to: secondSlow)
+    slowStore.accept([firstSlow])
+    let slowDeadline = Date().addingTimeInterval(3)
+    func cloudStarted() -> Bool { startedLock.lock(); defer { startedLock.unlock() }; return slowCloudStarted }
+    while !cloudStarted(), Date() < slowDeadline { RunLoop.main.run(until: Date().addingTimeInterval(0.01)) }
+    slowStore.accept([secondSlow])
+    while slowStore.entries.first?.stage != .imported, Date() < slowDeadline { RunLoop.main.run(until: Date().addingTimeInterval(0.01)) }
+    expect(slowStore.entries.count == 2 && slowStore.entries[0].stage == .imported && slowStore.cloudUpdateInProgress,
+           "a slow cloud request does not hold back the next import")
+    cloudGate.signal(); cloudGate.signal()
+    settle(slowStore)
+}
+
+// Music Drop's own finished downloads move into the library folder and leave no staging behind.
+do {
+    let moveRoot = root.appendingPathComponent("MoveState")
+    let staging = moveRoot.appendingPathComponent("Downloads/YouTube/\(UUID().uuidString)/Prepared", isDirectory: true)
+    try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+    let downloaded = staging.appendingPathComponent("Скачанный трек.m4a")
+    try Data("downloaded-audio".utf8).write(to: downloaded)
+    let moveStore = ImportStore(directory: moveRoot, services: services, startTimer: false)
+    let movedTrack = YouTubeTrack(id: "MoveTrack01", title: "Скачанный трек", artist: "Artist")
+    moveStore.acceptYouTube(downloaded, track: movedTrack)
+    settle(moveStore)
+    let managed = moveStore.entries[0].managedPath.map { URL(fileURLWithPath: $0) }
+    expect(moveStore.entries[0].stage == .imported && managed.map { FileManager.default.fileExists(atPath: $0.path) } == true
+           && (try? Data(contentsOf: managed!)) == Data("downloaded-audio".utf8),
+           "a finished M4A download is imported from the library folder with its bytes intact")
+    expect(!FileManager.default.fileExists(atPath: downloaded.path)
+           && !FileManager.default.fileExists(atPath: staging.deletingLastPathComponent().path)
+           && FileManager.default.fileExists(atPath: moveRoot.appendingPathComponent("Downloads/YouTube").path),
+           "the download is moved rather than copied and its empty staging folder is removed")
+    expect(moveStore.entry(youTubeID: movedTrack.id)?.id == moveStore.entries[0].id && moveStore.entry(soundCloudID: movedTrack.id) == nil,
+           "source indexes find the imported entry without scanning the history")
+}
 
 // The real scheduler is driven by a clock and fake Music replies, without personal-library writes.
 func settleCloud(_ store: ImportStore) {
@@ -630,6 +679,89 @@ catch SoundCloudError.rateLimited {
 let nativeArguments = SoundCloudService.nativeDownloadArguments(stream:resolvedAudio!,track:nativeResults[0],output:root.appendingPathComponent("prepared.m4a"))
 expect(nativeArguments.contains("copy") && !nativeArguments.contains("aac") && nativeArguments.contains("https,tls,tcp"),
        "the direct transfer preserves encoded audio and limits FFmpeg to HTTPS transport")
+expect(resolvedAudio?.isHLS == true, "HLS transcodings are marked for the parallel segment downloader")
+
+// Native HLS: a plain VOD playlist is fetched several segments at a time and joined in order.
+let hlsBase = URL(string:"https://playback.media-streaming.soundcloud.cloud/track/aac_160k/playlist.m3u8")!
+let hlsText = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXT-X-KEY:METHOD=NONE\n" + (0..<12).map { "#EXTINF:10.0,\nsegment-\($0).m4s" }.joined(separator:"\n") + "\n#EXT-X-ENDLIST\n"
+let hlsPlaylist = try SoundCloudSearchClient.parsePlaylist(hlsText, base: hlsBase)
+expect(hlsPlaylist.initSegment?.lastPathComponent == "init.mp4" && hlsPlaylist.segments.count == 12 && hlsPlaylist.segments[3].path.hasSuffix("/segment-3.m4s"),
+       "an HLS media playlist resolves its init and relative segment URLs")
+for rejected in ["#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"key\"\nsegment.ts\n#EXT-X-ENDLIST",
+                 "#EXTM3U\n#EXT-X-BYTERANGE:100@0\nsegment.ts\n#EXT-X-ENDLIST",
+                 "#EXTM3U\nsegment.ts",
+                 "#EXTM3U\nhttps://example.com/segment.ts\n#EXT-X-ENDLIST",
+                 "not a playlist"] {
+    do { _ = try SoundCloudSearchClient.parsePlaylist(rejected, base: hlsBase); fatalError("Unsupported playlist accepted") }
+    catch { expect(true, "encrypted, ranged, live, foreign or malformed playlists stay with FFmpeg") }
+}
+let masterPlaylist = try SoundCloudSearchClient.parsePlaylist("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=96000\nlow.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=160000\nhigh.m3u8\n", base: hlsBase)
+expect(masterPlaylist.segments.isEmpty && masterPlaylist.variants.map(\.bandwidth) == [96000, 160000], "a master playlist exposes its variants")
+let hlsLock = NSLock()
+var hlsActive = 0, hlsPeak = 0, hlsFailedOnce = false
+let hlsClient = SoundCloudSearchClient(cache: nativeCache, clientID: String(repeating:"a",count:32)) { request, _ in
+    let url = request.url!
+    if url.lastPathComponent == "playlist.m3u8" {
+        return (Data(hlsText.utf8), HTTPURLResponse(url:url,statusCode:200,httpVersion:nil,headerFields:nil)!)
+    }
+    hlsLock.lock(); hlsActive += 1; hlsPeak = max(hlsPeak, hlsActive)
+    let retry = url.lastPathComponent == "segment-5.m4s" && !hlsFailedOnce
+    if retry { hlsFailedOnce = true }
+    hlsLock.unlock()
+    Thread.sleep(forTimeInterval: Double.random(in: 0.01...0.05))
+    hlsLock.lock(); hlsActive -= 1; hlsLock.unlock()
+    if retry { throw SoundCloudError.message("dropped") }
+    return (Data((url.lastPathComponent + ";").utf8), HTTPURLResponse(url:url,statusCode:200,httpVersion:nil,headerFields:nil)!)
+}
+let joinedHLS = root.appendingPathComponent("joined.hls")
+var hlsProgress: [Int] = []
+try hlsClient.downloadHLS(hlsBase, to: joinedHLS, cancellation: SoundCloudCancellation()) { done, _ in hlsLock.lock(); hlsProgress.append(done); hlsLock.unlock() }
+let expectedHLS = (["init.mp4"] + (0..<12).map { "segment-\($0).m4s" }).map { $0 + ";" }.joined()
+expect(String(data: try! Data(contentsOf: joinedHLS), encoding: .utf8) == expectedHLS, "segments are joined in playlist order even when they finish out of order")
+expect(hlsPeak > 1 && hlsPeak <= 6, "several HLS segments download at the same time, within the concurrency limit")
+expect(hlsFailedOnce && hlsProgress.count == 13, "a dropped segment is retried once and progress covers every part")
+let cancelledHLS = SoundCloudCancellation(); cancelledHLS.cancel()
+do { try hlsClient.downloadHLS(hlsBase, to: root.appendingPathComponent("cancelled.hls"), cancellation: cancelledHLS) { _, _ in }; fatalError("Cancelled HLS finished") }
+catch { expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("cancelled.hls").path), "a cancelled HLS download leaves no partial file") }
+do {
+    try ParallelDownload.run(count: 4, concurrency: 2, destination: root.appendingPathComponent("oversized.parts"), maximumBytes: 10,
+                             cancellation: SoundCloudCancellation()) { _ in Data(repeating: 1, count: 6) }
+    fatalError("Oversized parallel download accepted")
+} catch { expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("oversized.parts").path), "the parallel downloader enforces the size limit across parts") }
+
+// The service joins native HLS locally and only rewraps it; no remote input reaches FFmpeg.
+let remuxLog = root.appendingPathComponent("remux-arguments")
+let remuxScript = root.appendingPathComponent("remux-encoder")
+try "#!/bin/sh\n/usr/bin/printf '%s\\n' \"$@\" >> '\(remuxLog.path)'\nwhile [ $# -gt 0 ]; do\n if [ \"$1\" = -i ]; then input=\"$2\"; fi\n output=\"$1\"; shift\ndone\ncase \"$input\" in https:*) exit 1;; esac\n/bin/cp \"$input\" \"$output\"\n".write(to: remuxScript, atomically: true, encoding: .utf8)
+try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: remuxScript.path)
+var hlsMetadata = audioMetadata
+hlsMetadata["media"] = ["transcodings":[transcoding("aac_160k")]]
+let hlsServiceClient = SoundCloudSearchClient(cache: nativeCache, clientID: String(repeating:"a",count:32)) { request, cancellation in
+    let url = request.url!
+    if url.path.hasPrefix("/tracks/") {
+        return (try JSONSerialization.data(withJSONObject: hlsMetadata), HTTPURLResponse(url:url,statusCode:200,httpVersion:nil,headerFields:nil)!)
+    }
+    if url.host == "api-v2.soundcloud.com" {
+        return (try JSONSerialization.data(withJSONObject: ["url": hlsBase.absoluteString]), HTTPURLResponse(url:url,statusCode:200,httpVersion:nil,headerFields:nil)!)
+    }
+    if url.lastPathComponent == "playlist.m3u8" {
+        return (Data(hlsText.utf8), HTTPURLResponse(url:url,statusCode:200,httpVersion:nil,headerFields:nil)!)
+    }
+    return (Data((url.lastPathComponent + ";").utf8), HTTPURLResponse(url:url,statusCode:200,httpVersion:nil,headerFields:nil)!)
+}
+let hlsService = SoundCloudService(helper: root.appendingPathComponent("no-helper"), ffmpeg: remuxScript, cache: nativeCache, searchClient: hlsServiceClient)
+var hlsStages: [String] = []
+let hlsFile = try hlsService.download(nativeResults[0], directory: root.appendingPathComponent("HLSAudio"), cancellation: SoundCloudCancellation()) { stage in
+    hlsLock.lock(); hlsStages.append(stage); hlsLock.unlock()
+}
+let remuxArguments = try String(contentsOf: remuxLog, encoding: .utf8)
+expect(String(data: try! Data(contentsOf: hlsFile), encoding: .utf8) == expectedHLS && hlsFile.pathExtension == "m4a",
+       "a SoundCloud HLS track arrives as one M4A built from its parallel segments")
+expect(remuxArguments.contains("file") && !remuxArguments.contains("https,tls,tcp") && remuxArguments.contains("copy"),
+       "FFmpeg only rewraps the local joined file without network access or re-encoding")
+expect(hlsStages.contains { $0.hasSuffix("100%") }, "native HLS reports download progress")
+expect((try! FileManager.default.contentsOfDirectory(atPath: hlsFile.deletingLastPathComponent().deletingLastPathComponent().path)) == ["Prepared"],
+       "the joined segment file is removed once the M4A is ready")
 
 if CommandLine.arguments.count > 1 {
     let fixtureAudio = URL(fileURLWithPath:CommandLine.arguments[1]).deletingLastPathComponent().appendingPathComponent("silence.m4a")
@@ -805,7 +937,33 @@ for invalid in [#"{"id":"wrong","title":"Wrong"}"#, #"{"id":"BaW_jenozKc","title
 expect(YouTubeService.errorMessage("Sign in to confirm you're not a bot").contains("анонимную"), "YouTube authentication errors explain the restriction")
 expect(YouTubeService.errorMessage("Video unavailable: private").contains("закрыто"), "private videos return an actionable error")
 let ytArgs = YouTubeService.encodeArguments(source: URL(fileURLWithPath:"/tmp/in.webm"), output:URL(fileURLWithPath:"/tmp/out.mp3"), track:ytTrack)
-expect(ytArgs.contains("libmp3lame") && ytArgs.contains("title=" + ytTrack.title) && ytArgs.contains("artist=" + ytTrack.artist), "YouTube always encodes MP3 and writes track metadata")
+expect(ytArgs.contains("libmp3lame") && ytArgs.contains("title=" + ytTrack.title) && ytArgs.contains("artist=" + ytTrack.artist), "MP3 mode encodes with LAME and writes track metadata")
+
+expect(YouTubeService.ranges(total: 4096) == [0...4095], "a small YouTube stream is fetched in one range")
+let middleRanges = YouTubeService.ranges(total: 5_000_000)
+expect(middleRanges.count == 4 && middleRanges.first?.lowerBound == 0 && middleRanges.last?.upperBound == 4_999_999
+       && zip(middleRanges, middleRanges.dropFirst()).allSatisfy { $0.upperBound + 1 == $1.lowerBound },
+       "a typical track splits into four contiguous ranges fetched in parallel")
+expect(YouTubeService.ranges(total: 100_000_000).allSatisfy { $0.count <= 10_485_760 }, "no range exceeds YouTube's 10 MB chunk size")
+
+final class GoogleVideoFixture: URLProtocol {
+    static var payload = Data()
+    static let lock = NSLock()
+    static var ranges: [String] = []
+    override class func canInit(with request: URLRequest) -> Bool { request.url?.host?.hasSuffix(".googlevideo.com") == true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        let header = request.value(forHTTPHeaderField: "Range") ?? ""
+        Self.lock.lock(); Self.ranges.append(header); Self.lock.unlock()
+        let bounds = header.dropFirst("bytes=".count).split(separator: "-").compactMap { Int($0) }
+        let slice = bounds.count == 2 ? Self.payload.subdata(in: bounds[0]..<min(Self.payload.count, bounds[1] + 1)) : Self.payload
+        let response = HTTPURLResponse(url: request.url!, statusCode: 206, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "audio/mp4"])!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: slice)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+    override func stopLoading() {}
+}
 
 if CommandLine.arguments.count > 1 {
     func quoteYT(_ value: String) -> String { "'" + value.replacingOccurrences(of:"'",with:"'\\''") + "'" }
@@ -819,7 +977,7 @@ if CommandLine.arguments.count > 1 {
     let argsLog = root.appendingPathComponent("yt-arguments")
     let helperYT = try scriptYT("youtube-fixture", "#!/bin/sh\n/usr/bin/printf '%s\\n' \"$@\" >> \(quoteYT(argsLog.path))\nfor arg do\n if [ \"$arg\" = --dump-single-json ]; then /usr/bin/printf '%s\\n' \(quoteYT(String(data:ytJSON,encoding:.utf8)!)); exit 0; fi\n if [ \"$next\" = yes ]; then pattern=\"$arg\"; next=no; fi\n if [ \"$arg\" = -o ]; then next=yes; fi\ndone\noutput=\"${pattern%.*}.m4a\"\n/bin/cp \(quoteYT(fixtureYT.path)) \"$output\"\n/usr/bin/printf '%s\\n' \"$output\"\n")
     let ffmpegYT = URL(fileURLWithPath:"/opt/homebrew/bin/ffmpeg")
-    let ytService = YouTubeService(helper:helperYT,ffmpeg:ffmpegYT,runtime:URL(fileURLWithPath:"/usr/bin/true"),cache:root.appendingPathComponent("YTCache"),fallback:nil)
+    let ytService = YouTubeService(helper:helperYT,ffmpeg:ffmpegYT,runtime:URL(fileURLWithPath:"/usr/bin/true"),cache:root.appendingPathComponent("YTCache"),fallback:nil,format:{ .mp3 })
     expect(try! ytService.resolve("https://youtu.be/"+ytID,cancellation:SoundCloudCancellation()) == ytTrack, "YouTube metadata is resolved through the validated canonical URL")
     let ytDirectory = root.appendingPathComponent("YTDownload")
     let ytFile = try ytService.download(ytTrack,directory:ytDirectory,cancellation:SoundCloudCancellation(),stage:{ _ in })
@@ -827,6 +985,31 @@ if CommandLine.arguments.count > 1 {
     expect(try! ImportServices().playable(ytFile), "the actual encoded MP3 is playable by AVFoundation")
     let loggedYT = try String(contentsOf:argsLog,encoding:.utf8)
     expect(loggedYT.contains("--no-playlist") && loggedYT.contains("--ignore-config") && loggedYT.contains("--no-plugin-dirs") && loggedYT.contains("--js-runtimes"), "YouTube helper disables external config and plugins and uses the explicit bundled runtime")
+    let loggedLines = loggedYT.split(separator:"\n")
+    expect(loggedLines.filter { $0 == "--dump-single-json" }.count == 1 && loggedLines.filter { $0 == "--load-info-json" }.count == 1,
+           "the link check and the download share one extractor run")
+    let m4aService = YouTubeService(helper:helperYT,ffmpeg:ffmpegYT,runtime:URL(fileURLWithPath:"/usr/bin/true"),cache:root.appendingPathComponent("YTCacheM4A"),fallback:nil,format:{ .m4a })
+    let m4aFile = try m4aService.download(ytTrack,directory:root.appendingPathComponent("YTDownloadM4A"),cancellation:SoundCloudCancellation(),stage:{ _ in })
+    expect(m4aFile.pathExtension == "m4a" && (try! ImportServices().playable(m4aFile)), "M4A mode keeps YouTube's AAC audio in a playable M4A file")
+    let m4aLog = try String(contentsOf:argsLog,encoding:.utf8).split(separator:"\n")
+    expect(m4aLog.contains("bestaudio[ext=m4a]/bestaudio/best"), "M4A mode asks the extractor for the AAC stream first")
+    // With a direct stream in the extractor's JSON, the audio comes straight from Google's servers.
+    GoogleVideoFixture.payload = try Data(contentsOf: fixtureYT)
+    let directLog = root.appendingPathComponent("yt-direct-arguments")
+    var directJSON = try JSONSerialization.jsonObject(with: ytJSON) as! [String: Any]
+    directJSON["protocol"] = "https"; directJSON["ext"] = "m4a"; directJSON["http_headers"] = ["User-Agent": "Fixture"]
+    directJSON["url"] = "https://rr1---sn-test.googlevideo.com/videoplayback?itag=140&clen=\(GoogleVideoFixture.payload.count)"
+    let directJSONText = String(data: try JSONSerialization.data(withJSONObject: directJSON), encoding: .utf8)!
+    let directHelper = try scriptYT("youtube-direct", "#!/bin/sh\n/usr/bin/printf '%s\\n' \"$@\" >> \(quoteYT(directLog.path))\nfor arg do\n if [ \"$arg\" = --dump-single-json ]; then /usr/bin/printf '%s\\n' \(quoteYT(directJSONText)); exit 0; fi\ndone\nexit 1\n")
+    let directConfig = URLSessionConfiguration.ephemeral; directConfig.protocolClasses = [GoogleVideoFixture.self]
+    let directService = YouTubeService(helper:directHelper,ffmpeg:ffmpegYT,runtime:URL(fileURLWithPath:"/usr/bin/true"),cache:root.appendingPathComponent("YTDirect"),fallback:nil,format:{ .m4a },transferConfiguration:directConfig)
+    _ = try directService.resolve("https://youtu.be/"+ytID,cancellation:SoundCloudCancellation())
+    let directFileYT = try directService.download(ytTrack,directory:root.appendingPathComponent("YTDirectDownload"),cancellation:SoundCloudCancellation(),stage:{ _ in })
+    let directArguments = try String(contentsOf: directLog, encoding: .utf8).split(separator: "\n")
+    expect(directFileYT.pathExtension == "m4a" && (try! ImportServices().playable(directFileYT)) && GoogleVideoFixture.ranges.allSatisfy { $0.hasPrefix("bytes=0-") },
+           "the direct YouTube stream is fetched by byte range and saved as playable M4A")
+    expect(directArguments.filter { $0 == "--dump-single-json" }.count == 1 && !directArguments.contains("--load-info-json"),
+           "with a direct stream yt-dlp runs only once, for the link check")
     var ytImports = 0, ytCloudRequests = 0
     var ytServices = services
     ytServices.playable = ImportServices().playable
@@ -861,11 +1044,15 @@ final class YouTubeFixture: YouTubeProviding {
     func download(_ track:YouTubeTrack,directory:URL,cancellation:SoundCloudCancellation,stage:@escaping(String)->Void) throws -> URL {
         lock.lock(); downloads += 1; lock.unlock()
         for _ in 0..<20 { if cancellation.isCancelled { throw SoundCloudError.cancelled }; Thread.sleep(forTimeInterval:0.01) }
-        return directory.appendingPathComponent(track.id+".mp3")
+        let file = directory.appendingPathComponent(UUID().uuidString).appendingPathComponent("Prepared").appendingPathComponent(track.id+".m4a")
+        try FileManager.default.createDirectory(at:file.deletingLastPathComponent(),withIntermediateDirectories:true)
+        try Data("audio".utf8).write(to:file)
+        return file
     }
+    var downloadCount: Int { lock.lock(); defer { lock.unlock() }; return downloads }
 }
 let ytProvider = YouTubeFixture()
-let ytModel = YouTubeStore(service:ytProvider,directory:root.appendingPathComponent("YTModel"))
+let ytModel = YouTubeStore(service:ytProvider,directory:root.appendingPathComponent("YTModel"),prefetch:false)
 ytModel.query = "old"; ytModel.search(); ytModel.query = "new"; ytModel.search()
 waitUI { !ytModel.isSearching }
 RunLoop.main.run(until:Date().addingTimeInterval(0.35))
@@ -882,6 +1069,58 @@ expect(ytReady == 1, "repeated YouTube Add presses produce one import handoff")
 ytModel.query = "failure"; ytModel.search()
 waitUI { !ytModel.isSearching }
 expect(ytModel.error != nil && ytModel.results.first?.id == ytID, "a failed next YouTube link preserves existing track cards and download controls")
+
+final class QuickYouTubeFixture: YouTubeProviding {
+    let inner = YouTubeFixture()
+    func preview(_ input:String,cancellation:SoundCloudCancellation) -> YouTubeTrack? {
+        input == "broken" ? YouTubeTrack(id:"zzzzzzzzzzz",title:"Quick broken",artist:"Artist") : YouTubeTrack(id:"BaW_jenozKc",title:"Quick",artist:"Artist")
+    }
+    func resolve(_ input:String,cancellation:SoundCloudCancellation) throws -> YouTubeTrack {
+        Thread.sleep(forTimeInterval:0.2)
+        if input == "broken" { throw DropError.message("Unavailable") }
+        return YouTubeTrack(id:"BaW_jenozKc",title:"Full",artist:"Artist",duration:10)
+    }
+    func download(_ track:YouTubeTrack,directory:URL,cancellation:SoundCloudCancellation,stage:@escaping(String)->Void) throws -> URL {
+        try inner.download(track,directory:directory,cancellation:cancellation,stage:stage)
+    }
+}
+let quickProvider = QuickYouTubeFixture()
+let prefetchModel = YouTubeStore(service:quickProvider,directory:root.appendingPathComponent("YTPrefetch"))
+var prefetchReady: [URL] = []
+prefetchModel.onReady = { file,_ in prefetchReady.append(file) }
+prefetchModel.query = "quick"; prefetchModel.search()
+waitUI { prefetchModel.results.first?.title == "Quick" }
+expect(prefetchModel.isSearching && prefetchModel.verifying.contains(ytID), "a quick title card appears before the full link check finishes")
+waitUI { prefetchModel.prefetchedIDs.contains(ytID) }
+expect(prefetchModel.results.first?.title == "Full" && prefetchReady.isEmpty && !prefetchModel.isDownloading,
+       "a checked link prefetches audio in the background without importing it")
+prefetchModel.add(prefetchModel.results[0])
+expect(prefetchReady.count == 1 && quickProvider.inner.downloadCount == 1 && FileManager.default.fileExists(atPath:prefetchReady[0].path),
+       "Add hands prefetched audio over at once without a second download")
+prefetchModel.query = "broken"; prefetchModel.search()
+waitUI { !prefetchModel.isSearching }
+expect(prefetchModel.error != nil && !prefetchModel.results.contains { $0.id == "zzzzzzzzzzz" } && prefetchModel.results.first?.id == ytID,
+       "a quick card whose full check fails is removed while earlier cards stay")
+let unusedModel = YouTubeStore(service:QuickYouTubeFixture(),directory:root.appendingPathComponent("YTUnused"))
+unusedModel.query = "quick"; unusedModel.search()
+waitUI { unusedModel.prefetchedIDs.contains(ytID) }
+unusedModel.cancelAll()
+expect(((try? FileManager.default.contentsOfDirectory(atPath:root.appendingPathComponent("YTUnused").path)) ?? []).isEmpty,
+       "prefetched audio that was never added is deleted when the app quits")
+
+let ytInfoJSON = Data(#"{"id":"BaW_jenozKc","title":"Info","uploader":"Channel","protocol":"https","ext":"m4a","url":"https://rr3---sn-test.googlevideo.com/videoplayback?itag=140&clen=4096","http_headers":{"User-Agent":"Test","Cookie":"secret"}}"#.utf8)
+let ytInfo = try YouTubeService.parseInfo(ytInfoJSON, expectedID: ytID)
+expect(ytInfo.audioURL?.host == "rr3---sn-test.googlevideo.com" && ytInfo.contentLength == 4096 && ytInfo.fileExtension == "m4a",
+       "the extractor's JSON yields a direct stream with its exact size")
+expect(ytInfo.headers["User-Agent"] == "Test" && ytInfo.headers["Cookie"] == nil, "direct YouTube requests reuse the extractor's headers but never cookies")
+for foreign in ["https://googlevideo.com.evil.test/videoplayback", "http://rr3---sn-test.googlevideo.com/videoplayback", "https://rr3---sn-test.googlevideo.com/other"] {
+    let json = String(data: ytInfoJSON, encoding: .utf8)!.replacingOccurrences(of: "https://rr3---sn-test.googlevideo.com/videoplayback?itag=140&clen=4096", with: foreign)
+    expect(try! YouTubeService.parseInfo(Data(json.utf8), expectedID: ytID).audioURL == nil, "only Google's HTTPS media endpoint is fetched directly")
+}
+let ytPreview = try YouTubeService.parsePreview(Data(#"{"title":"Быстрое\u0000 название","author_name":"Канал"}"#.utf8), expectedID: ytID)
+expect(ytPreview.id == ytID && ytPreview.artist == "Канал" && !ytPreview.title.contains("\0"), "the quick title card is sanitized and bound to the requested video")
+expect(YouTubeService.m4aArguments(source:URL(fileURLWithPath:"/tmp/in.m4a"),output:URL(fileURLWithPath:"/tmp/out.m4a"),track:ytTrack,codec:["-c:a","copy"]).contains("copy"),
+       "AAC input is rewrapped rather than re-encoded")
 
 let relayEndpoint = URL(string:"https://relay.example")!
 func relayJSON(_ id:String = "BaW_jenozKc", url:String = "https://relay.example/videoplayback?itag=140", extra:[String:Any] = [:]) throws -> Data {
@@ -903,6 +1142,11 @@ for extra:[String:Any] in [["videoId":"wrong"],["paid":true],["premium":true],["
 expect(YouTubeFallback.isAllowedURL(URL(string:"https://rr1.googlevideo.com/videoplayback")!,endpoint:relayEndpoint,media:true) && !YouTubeFallback.isAllowedURL(URL(string:"https://rr1.googlevideo.com/api/v1/videos/test")!,endpoint:relayEndpoint,media:false), "only audio transfers may redirect to Google's media hosts")
 expect(YouTubeFallback.isAllowedURL(URL(string:"https://yt-comp2.chocolatemoo53.com/videoplayback")!,endpoint:YouTubeFallback.defaultEndpoint,media:true), "the known fallback media server is permitted for audio redirects")
 expect(!YouTubeFallback.isAllowedURL(URL(string:"https://chocolatemoo53.com.evil.test/videoplayback")!,endpoint:YouTubeFallback.defaultEndpoint,media:true), "a lookalike fallback media host is rejected")
+let mixedFormats: [[String: Any]] = [["type":"audio/webm; codecs=\"opus\"","bitrate":"160000","url":"https://relay.example/videoplayback?itag=251","clen":"1000"],
+                                     ["type":"audio/mp4; codecs=\"mp4a.40.2\"","bitrate":"130000","url":"https://relay.example/videoplayback?itag=140","clen":"1000"]]
+expect(try! YouTubeFallback.parse(relayJSON(extra:["adaptiveFormats":mixedFormats]),expectedID:ytID,endpoint:relayEndpoint).fileExtension == "webm"
+       && YouTubeFallback.parse(relayJSON(extra:["adaptiveFormats":mixedFormats]),expectedID:ytID,endpoint:relayEndpoint,preferAAC:true).fileExtension == "m4a",
+       "M4A mode takes the fallback's AAC stream even when Opus has a higher bitrate")
 let relayRequest = YouTubeFallback.request(relayEndpoint)
 expect(!relayRequest.httpShouldHandleCookies && relayRequest.value(forHTTPHeaderField:"Cookie") == nil && relayRequest.value(forHTTPHeaderField:"Authorization") == nil, "fallback requests do not include browser cookies or account authorization")
 
@@ -919,11 +1163,14 @@ if CommandLine.arguments.count > 1 {
     let first = try client.resolve(ytID,cancellation:SoundCloudCancellation())
     _ = try client.resolve(ytID,cancellation:SoundCloudCancellation())
     expect(relayMetadataCalls == 1,"fallback metadata and signed stream URLs are cached briefly without a second network request")
-    let service = YouTubeService(helper:URL(fileURLWithPath:"/usr/bin/false"),ffmpeg:URL(fileURLWithPath:"/opt/homebrew/bin/ffmpeg"),runtime:URL(fileURLWithPath:"/usr/bin/true"),fallback:client)
+    let service = YouTubeService(helper:URL(fileURLWithPath:"/usr/bin/false"),ffmpeg:URL(fileURLWithPath:"/opt/homebrew/bin/ffmpeg"),runtime:URL(fileURLWithPath:"/usr/bin/true"),fallback:client,format:{ .mp3 })
     let fallbackTrack = try service.resolve("https://youtu.be/"+ytID,cancellation:SoundCloudCancellation())
     expect(fallbackTrack == first.track,"a failed anonymous YouTube extractor automatically resolves through the fallback")
     let fallbackFile = try service.download(fallbackTrack,directory:root.appendingPathComponent("RelayDownloads"),cancellation:SoundCloudCancellation(),stage:{ _ in })
     expect(relayDownloads == 1 && fallbackFile.pathExtension == "mp3" && (try! ImportServices().playable(fallbackFile)),"fallback audio becomes a real playable MP3 through the same encoding path")
+    let m4aFallbackService = YouTubeService(helper:URL(fileURLWithPath:"/usr/bin/false"),ffmpeg:URL(fileURLWithPath:"/opt/homebrew/bin/ffmpeg"),runtime:URL(fileURLWithPath:"/usr/bin/true"),fallback:client,format:{ .m4a })
+    let m4aFallbackFile = try m4aFallbackService.download(fallbackTrack,directory:root.appendingPathComponent("RelayDownloadsM4A"),cancellation:SoundCloudCancellation(),stage:{ _ in })
+    expect(m4aFallbackFile.pathExtension == "m4a" && (try! ImportServices().playable(m4aFallbackFile)),"fallback AAC audio is rewrapped as M4A without re-encoding")
     var refreshCalls = 0, streamCalls = 0
     let refreshing = YouTubeFallback(endpoint:relayEndpoint,transport:{ request,token,limit,destination in
         if let destination {

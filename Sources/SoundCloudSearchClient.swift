@@ -3,6 +3,14 @@ import Foundation
 struct SoundCloudAudioSource {
     let url: URL
     let fileExtension: String
+    var isHLS = false
+}
+
+/// A media playlist reduced to the parts the native downloader can join byte for byte.
+struct HLSPlaylist {
+    var initSegment: URL?
+    var segments: [URL] = []
+    var variants: [(url: URL, bandwidth: Int)] = []
 }
 
 /// Search uses only listing metadata. Audio extraction is deferred until Add.
@@ -100,9 +108,115 @@ final class SoundCloudSearchClient {
             guard streamResponse.statusCode == 200,
                   let stream = try JSONSerialization.jsonObject(with: streamData) as? [String: Any],
                   let rawURL = stream["url"] as? String, let url = URL(string: rawURL), Self.isMediaURL(url) else { return nil }
-            return SoundCloudAudioSource(url: url, fileExtension: candidate.fileExtension)
+            return SoundCloudAudioSource(url: url, fileExtension: candidate.fileExtension, isHLS: candidate.isHLS)
         }
         return nil
+    }
+
+    /// SoundCloud serves full tracks as many short HLS segments. Fetching several at once
+    /// avoids paying a full round trip per segment, which dominates a sequential download.
+    func downloadHLS(_ playlist: URL, to destination: URL, cancellation: SoundCloudCancellation,
+                     progress: @escaping (Int, Int) -> Void) throws {
+        var parsed = try loadPlaylist(playlist, cancellation: cancellation)
+        if parsed.segments.isEmpty, let variant = parsed.variants.max(by: { $0.bandwidth < $1.bandwidth }) {
+            parsed = try loadPlaylist(variant.url, cancellation: cancellation)
+        }
+        guard !parsed.segments.isEmpty else { throw SoundCloudError.message("SoundCloud не отдал сегменты аудио.") }
+        let parts = (parsed.initSegment.map { [$0] } ?? []) + parsed.segments
+        try ParallelDownload.run(count: parts.count, concurrency: 6, destination: destination, maximumBytes: 200_000_000,
+                                 cancellation: cancellation, progress: progress) { index in
+            let (data, response) = try self.request(parts[index], timeout: 15, cancellation: cancellation)
+            if response.statusCode == 429 { throw SoundCloudError.rateLimited }
+            guard [200, 206].contains(response.statusCode), !data.isEmpty else {
+                throw SoundCloudError.message("SoundCloud не отдал часть аудио (\(response.statusCode)).")
+            }
+            return data
+        }
+    }
+
+    private func loadPlaylist(_ url: URL, cancellation: SoundCloudCancellation) throws -> HLSPlaylist {
+        let (data, response) = try request(url, timeout: 10, cancellation: cancellation)
+        if response.statusCode == 429 { throw SoundCloudError.rateLimited }
+        guard response.statusCode == 200, data.count <= 2_000_000, let text = String(data: data, encoding: .utf8) else {
+            throw SoundCloudError.message("SoundCloud не отдал список сегментов (\(response.statusCode)).")
+        }
+        return try Self.parsePlaylist(text, base: response.url ?? url)
+    }
+
+    /// Accepts only plain VOD playlists. Encryption, byte ranges and live lists stay with FFmpeg.
+    static func parsePlaylist(_ text: String, base: URL) throws -> HLSPlaylist {
+        let lines = text.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        guard lines.first == "#EXTM3U" else { throw SoundCloudError.message("SoundCloud вернул непонятный список сегментов.") }
+        func resolve(_ value: String) throws -> URL {
+            guard let url = URL(string: value, relativeTo: base)?.absoluteURL, isMediaURL(url) else {
+                throw SoundCloudError.message("SoundCloud указал недопустимый адрес сегмента.")
+            }
+            return url
+        }
+        // Attribute lists are KEY=value pairs; quoted values may contain commas.
+        func attribute(_ name: String, in list: Substring) -> String? {
+            var rest = list
+            while let equals = rest.firstIndex(of: "=") {
+                let key = rest[..<equals].trimmingCharacters(in: .whitespaces)
+                var value = rest[rest.index(after: equals)...]
+                if value.hasPrefix("\"") {
+                    value = value.dropFirst()
+                    guard let close = value.firstIndex(of: "\"") else { return nil }
+                    rest = value[value.index(after: close)...]
+                    value = value[..<close]
+                } else {
+                    let end = value.firstIndex(of: ",") ?? value.endIndex
+                    rest = value[end...]
+                    value = value[..<end]
+                }
+                if key == name { return String(value) }
+                rest = rest.drop { $0 == "," || $0 == " " }
+            }
+            return nil
+        }
+        var playlist = HLSPlaylist()
+        var pendingBandwidth: Int?
+        var ended = false
+        for line in lines.dropFirst() {
+            if line.hasPrefix("#") {
+                let tag = line.split(separator: ":", maxSplits: 1)
+                let attributes = tag.count > 1 ? tag[1] : ""
+                switch tag[0] {
+                case "#EXT-X-KEY":
+                    guard attribute("METHOD", in: attributes) == "NONE" else {
+                        throw SoundCloudError.message("Зашифрованный поток загружается через FFmpeg.")
+                    }
+                case "#EXT-X-BYTERANGE":
+                    throw SoundCloudError.message("Поток с диапазонами загружается через FFmpeg.")
+                case "#EXT-X-MAP":
+                    guard attribute("BYTERANGE", in: attributes) == nil, playlist.initSegment == nil,
+                          let uri = attribute("URI", in: attributes) else {
+                        throw SoundCloudError.message("Поток с диапазонами загружается через FFmpeg.")
+                    }
+                    playlist.initSegment = try resolve(uri)
+                case "#EXT-X-STREAM-INF":
+                    pendingBandwidth = attribute("BANDWIDTH", in: attributes).flatMap(Int.init) ?? 0
+                case "#EXT-X-ENDLIST":
+                    ended = true
+                default:
+                    break
+                }
+                continue
+            }
+            if let bandwidth = pendingBandwidth {
+                playlist.variants.append((try resolve(line), bandwidth))
+                pendingBandwidth = nil
+            } else {
+                playlist.segments.append(try resolve(line))
+            }
+            guard playlist.segments.count + playlist.variants.count <= 10_000 else {
+                throw SoundCloudError.message("Слишком длинный список сегментов.")
+            }
+        }
+        guard playlist.segments.isEmpty || ended else {
+            throw SoundCloudError.message("Незавершённый поток загружается через FFmpeg.")
+        }
+        return playlist
     }
 
     static func isMediaURL(_ url: URL) -> Bool {
@@ -136,7 +250,7 @@ final class SoundCloudSearchClient {
             let quality = item["quality"] as? String == "hq" ? 5 : (bitrate >= 160 ? 0 : -1)
             let score = (quality + 2) * 1_000_000 + (ext == "m4a" ? 10_000 : 0)
                 + min(bitrate, 1_000) * 2 + (transport == "progressive" ? 1 : 0)
-            candidates.append((SoundCloudAudioSource(url: url, fileExtension: ext), score))
+            candidates.append((SoundCloudAudioSource(url: url, fileExtension: ext, isHLS: transport == "hls"), score))
         }
         return candidates.max(by: { $0.score < $1.score })?.source
     }
