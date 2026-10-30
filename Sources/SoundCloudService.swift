@@ -1,6 +1,14 @@
 import Foundation
 import Darwin
 
+/// The stream list a search result already carries, so Add can skip a metadata request.
+struct SoundCloudStreamHint: Equatable {
+    let transcoding: URL
+    let fileExtension: String
+    let isHLS: Bool
+    let authorization: String?
+}
+
 struct SoundCloudTrack: Identifiable, Equatable {
     let id: String
     let title: String
@@ -8,6 +16,7 @@ struct SoundCloudTrack: Identifiable, Equatable {
     let url: URL
     var duration: Double?
     var artwork: URL?
+    var stream: SoundCloudStreamHint?
 
     var durationLabel: String {
         guard let duration, duration.isFinite, duration >= 0 else { return "" }
@@ -52,6 +61,19 @@ protocol SoundCloudProviding {
     func search(_ input: String, cancellation: SoundCloudCancellation) throws -> [SoundCloudTrack]
     func download(_ track: SoundCloudTrack, directory: URL, cancellation: SoundCloudCancellation,
                   stage: @escaping (String) -> Void) throws -> URL
+    /// Like `download`, also reporting the fraction transferred once the size is known.
+    func download(_ track: SoundCloudTrack, directory: URL, cancellation: SoundCloudCancellation,
+                  stage: @escaping (String) -> Void, progress: @escaping (Double) -> Void) throws -> URL
+    /// Gets the connection ready before the first search; may block, call it off the main thread.
+    func prewarm()
+}
+
+extension SoundCloudProviding {
+    func download(_ track: SoundCloudTrack, directory: URL, cancellation: SoundCloudCancellation,
+                  stage: @escaping (String) -> Void, progress: @escaping (Double) -> Void) throws -> URL {
+        try download(track, directory: directory, cancellation: cancellation, stage: stage)
+    }
+    func prewarm() {}
 }
 
 final class SoundCloudService: SoundCloudProviding {
@@ -61,12 +83,12 @@ final class SoundCloudService: SoundCloudProviding {
     private let searchClient: SoundCloudSearchClient
     private let resultLock = NSLock()
     private var searchResults: [String: (date: Date, tracks: [SoundCloudTrack])] = [:]
+    private var lastPrewarm = Date.distantPast
     private let now: () -> Date
 
     init(helper: URL? = nil, ffmpeg: URL? = nil, cache: URL? = nil,
          searchClient: SoundCloudSearchClient? = nil, now: @escaping () -> Date = Date.init) {
-        self.helper = helper ?? (Bundle.main.resourceURL ?? Bundle.main.bundleURL)
-            .appendingPathComponent("Helpers/yt-dlp")
+        self.helper = helper ?? FileTools.extractor(in: Bundle.main.resourceURL ?? Bundle.main.bundleURL)
         self.ffmpeg = ffmpeg ?? ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]
             .map { URL(fileURLWithPath: $0) }.first { FileManager.default.isExecutableFile(atPath: $0.path) }
         self.cache = cache ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -160,8 +182,21 @@ final class SoundCloudService: SoundCloudProviding {
         return tracks
     }
 
+    func prewarm() {
+        resultLock.lock()
+        let due = now().timeIntervalSince(lastPrewarm) > 60
+        if due { lastPrewarm = now() }
+        resultLock.unlock()
+        if due { searchClient.prewarm() }
+    }
+
     func download(_ track: SoundCloudTrack, directory: URL, cancellation: SoundCloudCancellation,
                   stage: @escaping (String) -> Void) throws -> URL {
+        try download(track, directory: directory, cancellation: cancellation, stage: stage, progress: { _ in })
+    }
+
+    func download(_ track: SoundCloudTrack, directory: URL, cancellation: SoundCloudCancellation,
+                  stage: @escaping (String) -> Void, progress: @escaping (Double) -> Void) throws -> URL {
         guard let ffmpeg else {
             throw SoundCloudError.message("Не найден FFmpeg для подготовки аудио. На этом Mac нужен FFmpeg в /opt/homebrew/bin или /usr/local/bin.")
         }
@@ -177,7 +212,7 @@ final class SoundCloudService: SoundCloudProviding {
                 let prepared = try preparedURL(for: track, working: working, fileExtension: stream.fileExtension)
                 stage("Скачиваем с SoundCloud…")
                 if stream.isHLS, try nativeHLS(stream, track: track, working: working, prepared: prepared,
-                                               ffmpeg: ffmpeg, cancellation: cancellation, stage: stage) {
+                                               ffmpeg: ffmpeg, cancellation: cancellation, progress: progress) {
                     success = true
                     return prepared
                 }
@@ -200,12 +235,12 @@ final class SoundCloudService: SoundCloudProviding {
             throw SoundCloudError.message("Компонент загрузки SoundCloud не найден. Переустанови Music Drop из нового DMG.")
         }
         stage("Скачиваем с SoundCloud…")
-        let output = try run(helper, arguments: commonArguments + [
+        let output = try run(helper, arguments: commonArguments.filter { $0 != "--no-progress" } + ProgressTail.arguments + [
             "--concurrent-fragments", "4",
             "--no-simulate", "--max-filesize", "200M", "--extract-audio", "--audio-format", "best", "--ffmpeg-location", ffmpeg.path,
             "--print", "after_move:filepath", "-o", working.appendingPathComponent("audio.%(ext)s").path,
             "--", target
-        ], cancellation: cancellation, timeout: 900)
+        ], cancellation: cancellation, timeout: 900, progress: progress)
         let lastLine = String(data: output, encoding: .utf8)?.split(whereSeparator: \.isNewline).last.map(String.init) ?? ""
         let audio = URL(fileURLWithPath: lastLine).standardizedFileURL
         guard audio.path.hasPrefix(working.standardizedFileURL.path + "/"),
@@ -232,19 +267,18 @@ final class SoundCloudService: SoundCloudProviding {
     /// Joins the segments locally, then only rewraps them, so no audio is re-encoded.
     /// Returns false when FFmpeg should stream the playlist itself instead.
     private func nativeHLS(_ stream: SoundCloudAudioSource, track: SoundCloudTrack, working: URL, prepared: URL,
-                           ffmpeg: URL, cancellation: SoundCloudCancellation, stage: @escaping (String) -> Void) throws -> Bool {
+                           ffmpeg: URL, cancellation: SoundCloudCancellation, progress: @escaping (Double) -> Void) throws -> Bool {
         let joined = working.appendingPathComponent("stream.hls")
         defer { try? FileManager.default.removeItem(at: joined) }
-        var reported = -1
+        var reported = 0
         let lock = NSLock()
         do {
             try searchClient.downloadHLS(stream.url, to: joined, cancellation: cancellation) { done, total in
-                let percent = done * 100 / max(1, total)
-                // Under the lock, so parts finishing together never report percentages out of order.
+                // Under the lock, so parts finishing together never report out of order.
                 lock.lock(); defer { lock.unlock() }
-                guard percent / 5 != reported / 5 else { return }
-                reported = percent
-                stage("Скачиваем с SoundCloud… \(percent)%")
+                guard done > reported else { return }
+                reported = done
+                progress(Double(done) / Double(max(1, total)))
             }
             if cancellation.isCancelled { throw SoundCloudError.cancelled }
             _ = try run(ffmpeg, arguments: Self.localPrepareArguments(input: joined, track: track, output: prepared),
@@ -298,7 +332,7 @@ final class SoundCloudService: SoundCloudProviding {
 
     /// Files for stdout/stderr prevent pipe-buffer deadlocks on large JSON results.
     private func run(_ executable: URL, arguments: [String], cancellation: SoundCloudCancellation,
-                     timeout: TimeInterval) throws -> Data {
+                     timeout: TimeInterval, progress: ((Double) -> Void)? = nil) throws -> Data {
         if cancellation.isCancelled { throw SoundCloudError.cancelled }
         let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("musicdrop-command-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
@@ -321,6 +355,7 @@ final class SoundCloudService: SoundCloudProviding {
         process.standardInput = FileHandle.nullDevice
         try process.run()
         cancellation.attach(process)
+        let tail = progress.map { ProgressTail(files: [outputURL, errorURL], report: $0) }
         let deadline = Date().addingTimeInterval(timeout)
         func stop() {
             if process.isRunning { process.terminate() }
@@ -336,6 +371,7 @@ final class SoundCloudService: SoundCloudProviding {
                 throw SoundCloudError.message("SoundCloud долго не отвечает. Проверь соединение и попробуй снова.")
             }
             Thread.sleep(forTimeInterval: 0.1)
+            tail?.poll()
         }
         process.waitUntilExit()
         if cancellation.isCancelled { throw SoundCloudError.cancelled }

@@ -4,15 +4,18 @@ import AppKit
 struct SoundCloudPanel: View {
     @Bindable var model: SoundCloudStore
     var imports: ImportStore
+    var navigation: PanelNavigation
+    @FocusState private var searchFocused: Bool
 
     var body: some View {
         VStack(spacing: 12) {
             HStack(spacing: 7) {
                 TextField("Название, автор или ссылка", text: $model.query)
                     .textFieldStyle(.roundedBorder)
-                    .onSubmit { model.search() }
+                    .focused($searchFocused)
+                    .onSubmit(submit)
                     .accessibilityLabel("Поиск треков SoundCloud")
-                Button { model.search() } label: {
+                Button(action: submit) {
                     Image(systemName: "magnifyingglass").frame(width: 20, height: 20)
                 }
                 .buttonStyle(.borderedProminent).tint(.orange)
@@ -20,6 +23,10 @@ struct SoundCloudPanel: View {
                 .accessibilityLabel("Искать на SoundCloud")
             }
             .padding(.horizontal, 20)
+            .onAppear { model.prewarm() }
+            // Focus on arrival and on every ⌘F.
+            .task(id: navigation.focusRequest) { searchFocused = true }
+            .onChange(of: model.results) { ArtworkLoader.shared.prefetch(model.results.compactMap(\.artwork)) }
             if model.isSearching {
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.small)
@@ -53,18 +60,19 @@ struct SoundCloudPanel: View {
         }
     }
 
+    /// A pasted YouTube link opens in its own tab instead of becoming a SoundCloud query.
+    private func submit() {
+        if case .youTube? = LinkRoute.detect(model.query) { navigation.open(.youTube(model.query)) }
+        else { model.search() }
+    }
+
     private func trackRow(_ track: SoundCloudTrack) -> some View {
         let entry = imports.entry(soundCloudID: track.id)
         let working = entry?.stage == .queued || entry?.stage == .importing
         let added = entry?.stage == .imported
         return VStack(alignment: .leading, spacing: 7) {
             HStack(alignment: .top, spacing: 10) {
-                AsyncImage(url: track.artwork) { image in image.resizable().scaledToFill() } placeholder: {
-                    Image(systemName: "waveform").font(.system(size: 18)).foregroundStyle(.orange)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .background(Color.orange.opacity(0.08))
-                }
-                .frame(width: 44, height: 44).clipShape(RoundedRectangle(cornerRadius: 8))
+                ArtworkView(url: track.artwork, symbol: "waveform", tint: .orange)
                 VStack(alignment: .leading, spacing: 4) {
                     Text(track.title).font(.system(size: 12, weight: .medium)).lineLimit(2)
                     Text(track.artist).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
@@ -93,10 +101,7 @@ struct SoundCloudPanel: View {
                 }
             }
             if let state = model.downloadStates[track.id] {
-                HStack(spacing: 6) {
-                    ProgressView().controlSize(.mini)
-                    Text(state).font(.system(size: 10)).foregroundStyle(.secondary)
-                }.padding(.leading, 54)
+                DownloadStatus(state: state, progress: model.downloadProgress[track.id]).padding(.leading, 54)
             } else if let error = model.downloadErrors[track.id] {
                 Text(error).font(.system(size: 11)).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true).padding(.leading, 54)

@@ -4,15 +4,19 @@ import AppKit
 struct YouTubePanel: View {
     @Bindable var model: YouTubeStore
     var imports: ImportStore
+    var navigation: PanelNavigation
     @AppStorage(YouTubeAudioFormat.defaultsKey) private var format: YouTubeAudioFormat = .m4a
+    @FocusState private var searchFocused: Bool
 
     var body: some View {
         VStack(spacing: 12) {
             HStack(spacing: 7) {
                 TextField("Ссылка YouTube или YouTube Music", text: $model.query)
-                    .textFieldStyle(.roundedBorder).onSubmit { model.search() }
+                    .textFieldStyle(.roundedBorder).focused($searchFocused).onSubmit(submit)
                     .accessibilityLabel("Ссылка на трек YouTube")
-                Button { model.search() } label: { Image(systemName: "arrow.right").frame(width: 20, height: 20) }
+                    // Focus on arrival and on every ⌘F.
+                    .task(id: navigation.focusRequest) { searchFocused = true }
+                Button(action: submit) { Image(systemName: "arrow.right").frame(width: 20, height: 20) }
                     .buttonStyle(.borderedProminent).tint(.red)
                     .disabled(model.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     .accessibilityLabel("Проверить ссылку YouTube")
@@ -49,17 +53,19 @@ struct YouTubePanel: View {
         }
     }
 
+    /// SoundCloud links and plain words go to SoundCloud; YouTube links and malformed links stay here.
+    private func submit() {
+        switch LinkRoute.forInput(model.query) {
+        case .soundCloud(let text)?: navigation.open(.soundCloud(text))
+        default: model.search()
+        }
+    }
+
     private func row(_ track: YouTubeTrack) -> some View {
         let entry = imports.entry(youTubeID: track.id)
         return VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .top, spacing: 10) {
-                AsyncImage(url: URL(string: "https://i.ytimg.com/vi/\(track.id)/mqdefault.jpg")) { image in
-                    image.resizable().scaledToFill()
-                } placeholder: {
-                    Image(systemName: "play.rectangle.fill").font(.system(size: 22)).foregroundStyle(.red)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity).background(.red.opacity(0.08))
-                }
-                .frame(width: 44, height: 44).clipShape(RoundedRectangle(cornerRadius: 9))
+                ArtworkView(url: URL(string: "https://i.ytimg.com/vi/\(track.id)/mqdefault.jpg"), symbol: "play.rectangle.fill", tint: .red)
                 VStack(alignment: .leading, spacing: 5) {
                     Text(track.title).font(.system(size: 13, weight: .medium)).lineLimit(3)
                     Text(track.artist).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(2)
@@ -78,8 +84,7 @@ struct YouTubePanel: View {
             }
             if let state = model.downloadStates[track.id] {
                 HStack {
-                    ProgressView().controlSize(.small)
-                    Text(state).font(.system(size: 11)).foregroundStyle(.secondary)
+                    DownloadStatus(state: state, progress: model.downloadProgress[track.id])
                     Spacer()
                     Button { model.cancel(track) } label: { Image(systemName: "xmark.circle") }
                         .buttonStyle(.borderless).accessibilityLabel("Отменить загрузку YouTube")
@@ -103,7 +108,7 @@ struct YouTubePanel: View {
                         Button("Показать в «Музыке»") { imports.openMusic(entry) }
                         Spacer()
                         if let path = entry.managedPath {
-                            Button("Показать MP3") { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)]) }
+                            Button("Показать файл") { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)]) }
                         }
                     }.buttonStyle(.borderless).font(.system(size: 11))
                 } else {

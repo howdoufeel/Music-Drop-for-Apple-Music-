@@ -16,6 +16,13 @@ if [ -d "$project_dir/Resources" ]; then
 fi
 lipo -create "$project_dir/build/MusicDrop-arm64" "$project_dir/build/MusicDrop-x86_64" \
     -output "$bundle/Contents/MacOS/MusicDrop"
+# The unpacked yt-dlp carries its own libraries; give every nested binary a local signature
+# so the sealed bundle verifies regardless of how upstream signed them.
+if [ -d "$bundle/Contents/Resources/Helpers/yt-dlp" ]; then
+    find "$bundle/Contents/Resources/Helpers/yt-dlp" -type f -print0 | while IFS= read -r -d '' file; do
+        if file -b "$file" | grep -q "Mach-O"; then codesign --force --sign - "$file"; fi
+    done
+fi
 codesign --force --sign - --options runtime --entitlements "$project_dir/entitlements.plist" "$bundle"
 codesign --verify --deep --strict "$bundle"
 ln -s /Applications "$staging_dir/Applications"

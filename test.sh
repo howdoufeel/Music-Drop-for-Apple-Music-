@@ -9,7 +9,7 @@ cp "$project_dir/Sources/Core.swift" "$project_dir/Sources/MusicBridge.swift" \
     "$project_dir/Sources/CloudBridgeProtocol.swift" "$project_dir/Sources/CloudMenu.swift" "$project_dir/Sources/ImportStore.swift" \
     "$project_dir/Sources/SoundCloudService.swift" "$project_dir/Sources/SoundCloudSearchClient.swift" "$project_dir/Sources/SoundCloudStore.swift" \
     "$project_dir/Sources/YouTubeFallback.swift" "$project_dir/Sources/YouTubeService.swift" "$project_dir/Sources/YouTubeStore.swift" \
-    "$project_dir/Sources/ParallelDownload.swift" \
+    "$project_dir/Sources/ParallelDownload.swift" "$project_dir/Sources/LinkRoute.swift" \
     "$project_dir/Tests/Integration/main.swift" "$test_dir/"
 xcrun swiftc -swift-version 5 \
     "$test_dir"/*.swift -o "$test_dir/IntegrationTests"

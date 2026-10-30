@@ -9,6 +9,8 @@ import Observation
     var error: String?
     var downloadStates: [String: String] = [:]
     var downloadErrors: [String: String] = [:]
+    /// Fraction transferred, present only while the current phase has a known size.
+    var downloadProgress: [String: Double] = [:]
     private let service: SoundCloudProviding
     private let searchQueue = DispatchQueue(label: "tech.musicdrop.soundcloud.search", qos: .userInitiated, attributes: .concurrent)
     private let downloadQueue: OperationQueue = {
@@ -69,6 +71,13 @@ import Observation
         }
     }
 
+    /// Called when the SoundCloud tab opens, so the first search does not pay for the connection.
+    func prewarm() {
+        guard !preview else { return }
+        let service = self.service
+        searchQueue.async { service.prewarm() }
+    }
+
     func add(_ track: SoundCloudTrack) {
         guard !preview else { error = "Это предпросмотр. Добавление в медиатеку отключено."; return }
         guard downloadTokens[track.id] == nil else { return }
@@ -80,15 +89,24 @@ import Observation
         downloadQueue.addOperation { [weak self] in
             guard let self, !token.isCancelled else { return }
             do {
-                let file = try self.service.download(track, directory: self.directory, cancellation: token) { state in
+                let file = try self.service.download(track, directory: self.directory, cancellation: token, stage: { state in
                     DispatchQueue.main.async {
-                        if self.downloadTokens[track.id] === token { self.downloadStates[track.id] = state }
+                        guard self.downloadTokens[track.id] === token else { return }
+                        self.downloadStates[track.id] = state
+                        self.downloadProgress[track.id] = nil
                     }
-                }
+                }, progress: { value in
+                    DispatchQueue.main.async {
+                        guard self.downloadTokens[track.id] === token else { return }
+                        // Whole percents are enough; finer steps would only re-render the row.
+                        if value >= 1 || value - (self.downloadProgress[track.id] ?? -1) >= 0.01 { self.downloadProgress[track.id] = value }
+                    }
+                })
                 DispatchQueue.main.async {
                     guard self.downloadTokens[track.id] === token else { return }
                     self.downloadTokens[track.id] = nil
                     self.downloadStates[track.id] = nil
+                    self.downloadProgress[track.id] = nil
                     if !token.isCancelled { self.onReady?(file, track) }
                     self.onActivity?()
                 }
@@ -97,6 +115,7 @@ import Observation
                     guard self.downloadTokens[track.id] === token else { return }
                     self.downloadTokens[track.id] = nil
                     self.downloadStates[track.id] = nil
+                    self.downloadProgress[track.id] = nil
                     if !token.isCancelled { self.downloadErrors[track.id] = error.localizedDescription }
                     self.onActivity?()
                 }
@@ -108,6 +127,7 @@ import Observation
         downloadTokens[track.id]?.cancel()
         downloadTokens[track.id] = nil
         downloadStates[track.id] = nil
+        downloadProgress[track.id] = nil
         downloadErrors[track.id] = nil
         onActivity?()
     }

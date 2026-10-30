@@ -9,6 +9,8 @@ import Observation
     var error: String?
     var downloadStates: [String: String] = [:]
     var downloadErrors: [String: String] = [:]
+    /// Fraction transferred, present only while the current phase has a known size.
+    var downloadProgress: [String: Double] = [:]
     /// Quick title cards still waiting for the full availability check.
     private(set) var verifying: Set<String> = []
     /// Audio already fetched in the background; Add hands it off at once.
@@ -28,6 +30,7 @@ import Observation
     @ObservationIgnored private var requested: Set<String> = []
     @ObservationIgnored private var prefetched: [String: URL] = [:]
     @ObservationIgnored private var lastStage: [String: String] = [:]
+    @ObservationIgnored private var lastProgress: [String: Double] = [:]
     private let preview: Bool
     private let prefetch: Bool
     let directory: URL
@@ -119,6 +122,7 @@ import Observation
         guard requested.insert(track.id).inserted else { return }
         downloadErrors[track.id] = nil
         downloadStates[track.id] = lastStage[track.id] ?? "В очереди на загрузку"
+        downloadProgress[track.id] = lastProgress[track.id]
         onActivity?()
         if downloadTokens[track.id] == nil { start(track) }
     }
@@ -130,13 +134,24 @@ import Observation
         downloadQueue.addOperation { [weak self] in
             guard let self, !token.isCancelled else { return }
             do {
-                let file = try self.service.download(track, directory: self.directory, cancellation: token) { state in
+                let file = try self.service.download(track, directory: self.directory, cancellation: token, stage: { state in
                     DispatchQueue.main.async {
                         guard self.downloadTokens[track.id] === token else { return }
                         self.lastStage[track.id] = state
-                        if self.requested.contains(track.id) { self.downloadStates[track.id] = state }
+                        self.lastProgress[track.id] = nil
+                        if self.requested.contains(track.id) {
+                            self.downloadStates[track.id] = state
+                            self.downloadProgress[track.id] = nil
+                        }
                     }
-                }
+                }, progress: { value in
+                    DispatchQueue.main.async {
+                        guard self.downloadTokens[track.id] === token,
+                              value >= 1 || value - (self.lastProgress[track.id] ?? -1) >= 0.01 else { return }
+                        self.lastProgress[track.id] = value
+                        if self.requested.contains(track.id) { self.downloadProgress[track.id] = value }
+                    }
+                })
                 DispatchQueue.main.async { self.finish(track, token: token, result: .success(file)) }
             } catch {
                 DispatchQueue.main.async { self.finish(track, token: token, result: .failure(error)) }
@@ -151,8 +166,10 @@ import Observation
         }
         downloadTokens[track.id] = nil
         lastStage[track.id] = nil
+        lastProgress[track.id] = nil
         let wanted = requested.remove(track.id) != nil
         downloadStates[track.id] = nil
+        downloadProgress[track.id] = nil
         switch result {
         case .success(let file):
             if token.isCancelled { discard(file) }
@@ -176,7 +193,9 @@ import Observation
         downloadTokens[track.id] = nil
         requested.remove(track.id)
         lastStage[track.id] = nil
+        lastProgress[track.id] = nil
         downloadStates[track.id] = nil
+        downloadProgress[track.id] = nil
         downloadErrors[track.id] = nil
         onActivity?()
     }

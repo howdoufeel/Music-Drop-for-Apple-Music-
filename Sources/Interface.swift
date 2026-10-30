@@ -3,28 +3,83 @@ import AppKit
 
 private let accent = Color(nsColor: .systemPink)
 
+/// Shared by the window, the popover and the menus: one selected tab, and links from any
+/// paste, drop or field open in the source they belong to.
+@Observable final class PanelNavigation {
+    enum Tab: Int { case library, soundCloud, youTube }
+    var tab = Tab.library
+    /// Bumped to move keyboard focus into the visible search field.
+    var focusRequest = 0
+    private let soundCloud: SoundCloudStore
+    private let youtube: YouTubeStore
+
+    init(soundCloud: SoundCloudStore, youtube: YouTubeStore) {
+        self.soundCloud = soundCloud
+        self.youtube = youtube
+    }
+
+    func open(_ route: LinkRoute) {
+        switch route {
+        case .youTube(let link):
+            tab = .youTube
+            youtube.query = link
+            youtube.search()
+        case .soundCloud(let text):
+            tab = .soundCloud
+            soundCloud.query = text
+            soundCloud.search()
+        }
+    }
+
+    func focusSearch() {
+        if tab == .library { tab = .soundCloud }
+        focusRequest += 1
+    }
+}
+
+/// One download's phase, with a real bar once the size is known.
+struct DownloadStatus: View {
+    let state: String
+    let progress: Double?
+
+    var body: some View {
+        HStack(spacing: 6) {
+            if let progress {
+                ProgressView(value: progress).progressViewStyle(.linear).controlSize(.small).frame(width: 80)
+                Text("\(Int((progress * 100).rounded()))%").monospacedDigit()
+            } else {
+                ProgressView().controlSize(.mini)
+            }
+            Text(state).lineLimit(1)
+        }
+        .font(.system(size: 10)).foregroundStyle(.secondary)
+        .accessibilityElement(children: .combine)
+    }
+}
+
 struct DropPanel: View {
     var store: ImportStore
     var soundCloud: SoundCloudStore
     var youtube: YouTubeStore
+    @Bindable var navigation: PanelNavigation
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @AppStorage(YouTubeAudioFormat.defaultsKey) private var youtubeFormat: YouTubeAudioFormat = .m4a
+    @AppStorage(YouTubeFallbackRace.defaultsKey) private var raceFallback = true
     @State private var fileTargeted = false
-    @State private var selectedTab = 0
 
     var body: some View {
         VStack(spacing: 0) {
             header
-            Picker("Раздел", selection: $selectedTab) {
-                Text("Медиатека").tag(0)
-                Text("SoundCloud").tag(1)
-                Text("YouTube").tag(2)
+            Picker("Раздел", selection: $navigation.tab) {
+                Text("Медиатека").tag(PanelNavigation.Tab.library)
+                Text("SoundCloud").tag(PanelNavigation.Tab.soundCloud)
+                Text("YouTube").tag(PanelNavigation.Tab.youTube)
             }
             .pickerStyle(.segmented).labelsHidden().padding(.horizontal, 20).padding(.bottom, 14)
-            if selectedTab == 2 {
-                YouTubePanel(model: youtube, imports: store)
-            } else if selectedTab == 1 {
-                SoundCloudPanel(model: soundCloud, imports: store)
+            if navigation.tab == .youTube {
+                YouTubePanel(model: youtube, imports: store, navigation: navigation)
+            } else if navigation.tab == .soundCloud {
+                SoundCloudPanel(model: soundCloud, imports: store, navigation: navigation)
             } else {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
@@ -43,7 +98,7 @@ struct DropPanel: View {
         .background(.regularMaterial)
         .animation(reduceMotion ? nil : .easeInOut(duration: 0.18), value: store.dragActive || fileTargeted)
         .animation(reduceMotion ? nil : .easeInOut(duration: 0.18), value: store.settingsVisible)
-        .onDrop(of: [.fileURL], isTargeted: $fileTargeted, perform: acceptProviders)
+        .onDrop(of: [.fileURL, .url], isTargeted: $fileTargeted, perform: acceptProviders)
     }
 
     private var header: some View {
@@ -59,7 +114,7 @@ struct DropPanel: View {
                     .font(.system(size: 11)).foregroundStyle(.secondary)
             }
             Spacer()
-            Button { selectedTab = 0; store.settingsVisible.toggle() } label: {
+            Button { navigation.tab = .library; store.settingsVisible.toggle() } label: {
                 Image(systemName: "slider.horizontal.3").font(.system(size: 14))
                     .frame(width: 28, height: 28)
             }
@@ -81,7 +136,7 @@ struct DropPanel: View {
             VStack(spacing: 5) {
                 Text(targeted ? "Отпусти — и готово" : "Перетащи сюда MP3")
                     .font(.system(size: 18, weight: .semibold))
-                Text("В медиатеку и избранное")
+                Text("Или ссылку SoundCloud/YouTube · ⌘V вставит её из буфера")
                     .font(.system(size: 12)).foregroundStyle(.secondary)
             }
             Button("Выбрать файлы…") { store.chooseFiles() }
@@ -169,6 +224,8 @@ struct DropPanel: View {
                 Text("MP3 · для старых плееров").tag(YouTubeAudioFormat.mp3)
             }
             .pickerStyle(.menu).controlSize(.small).font(.system(size: 12))
+            Toggle("Резервный сервис, если YouTube медлит дольше 5 с", isOn: $raceFallback)
+                .toggleStyle(.switch).controlSize(.small).font(.system(size: 12))
             HStack {
                 Button("Открыть «Музыку»") { store.openMusic() }
                 Spacer()
@@ -224,6 +281,14 @@ struct DropPanel: View {
 
     private func acceptProviders(_ providers: [NSItemProvider]) -> Bool {
         let supported = providers.filter { $0.hasItemConformingToTypeIdentifier("public.file-url") }
+        // A link dragged from the browser opens in its source tab.
+        if supported.isEmpty, let link = providers.first(where: { $0.hasItemConformingToTypeIdentifier("public.url") }) {
+            _ = link.loadObject(ofClass: URL.self) { url, _ in
+                guard let url, let route = LinkRoute.detect(url.absoluteString) else { return }
+                DispatchQueue.main.async { navigation.open(route) }
+            }
+            return true
+        }
         guard !supported.isEmpty else { return false }
         let group = DispatchGroup()
         let lock = NSLock()

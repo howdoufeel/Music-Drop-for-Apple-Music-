@@ -620,6 +620,28 @@ expect(refreshRequests[2].value(forHTTPHeaderField: "Range") == "bytes=0-65535",
 expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("RenewedSearch/public-client.json").path),
        "renewed website identifier persists for fast subsequent launches")
 
+let probeLock = NSLock()
+var probeActive = 0, probePeak = 0
+let probeClient = SoundCloudSearchClient(cache: root.appendingPathComponent("ProbeSearch"), clientID: String(repeating: "a", count: 32)) { request, _ in
+    let url = request.url!
+    if url.path == "/search/tracks" {
+        let renewed = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "client_id" }?.value == renewedID
+        return (nativeListing, HTTPURLResponse(url: url, statusCode: renewed ? 200 : 401, httpVersion: nil, headerFields: nil)!)
+    }
+    if url.host == "soundcloud.com" {
+        let page = (0..<6).map { "<script src=\"https://a-v2.sndcdn.com/assets/\($0).js\"></script>" }.joined()
+        return (Data(page.utf8), HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+    }
+    probeLock.lock(); probeActive += 1; probePeak = max(probePeak, probeActive); probeLock.unlock()
+    Thread.sleep(forTimeInterval: 0.2)
+    probeLock.lock(); probeActive -= 1; probeLock.unlock()
+    let body = url.lastPathComponent == "1.js" ? "client_id:\"\(renewedID)\"" : "var unrelated = 1"
+    return (Data(body.utf8), HTTPURLResponse(url: url, statusCode: 206, httpVersion: nil, headerFields: nil)!)
+}
+let probeStarted = Date()
+expect((try! probeClient.search("scsearch15:query", cancellation: SoundCloudCancellation())).count == 1 && probePeak > 1
+       && Date().timeIntervalSince(probeStarted) < 1, "a rotated website identifier is found by probing several scripts at once")
+
 var limitedRequests = 0
 let limitedClient = SoundCloudSearchClient(cache: nativeCache, clientID: String(repeating: "a", count: 32)) { request, _ in
     limitedRequests += 1
@@ -671,6 +693,28 @@ expect(audioRequests.count == 2 && resolvedAudio?.url == mediaURL && resolvedAud
 let audioQuery = URLComponents(url:audioRequests[1].url!,resolvingAgainstBaseURL:false)!.queryItems!
 expect(audioQuery.first { $0.name == "track_authorization" }?.value == "public-stream-token",
        "direct audio forwards the track authorization provided by SoundCloud")
+let hintedListing = try JSONSerialization.data(withJSONObject: ["collection": [audioMetadata]])
+let hintedTrack = try SoundCloudSearchClient.parse(hintedListing)[0]
+expect(hintedTrack.stream?.isHLS == true && hintedTrack.stream?.authorization == "public-stream-token" && hintedTrack.stream?.fileExtension == "m4a",
+       "search results keep their stream list and authorization")
+audioRequests = []
+let hintedAudio = try audioClient.audioStream(for: hintedTrack, cancellation: SoundCloudCancellation())
+expect(audioRequests.count == 1 && hintedAudio?.url == mediaURL && !audioRequests[0].url!.path.hasPrefix("/tracks/"),
+       "Add skips the metadata request when the search result already lists the stream")
+var staleRequests: [URLRequest] = []
+let staleClient = SoundCloudSearchClient(cache: nativeCache, clientID: String(repeating:"a",count:32)) { request, _ in
+    staleRequests.append(request)
+    let url = request.url!
+    if url.path.hasPrefix("/tracks/") {
+        return (try JSONSerialization.data(withJSONObject: audioMetadata), HTTPURLResponse(url:url,statusCode:200,httpVersion:nil,headerFields:nil)!)
+    }
+    let fresh = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.contains { $0.value == "public-stream-token" } == true && staleRequests.count > 1
+    return (try JSONSerialization.data(withJSONObject: ["url": mediaURL.absoluteString]),
+            HTTPURLResponse(url:url,statusCode:fresh ? 200 : 401,httpVersion:nil,headerFields:nil)!)
+}
+let staleAudio = try staleClient.audioStream(for: hintedTrack, cancellation: SoundCloudCancellation())
+expect(staleAudio?.url == mediaURL && staleRequests.count == 3 && staleRequests[1].url!.path.hasPrefix("/tracks/"),
+       "an expired search authorization falls back to fresh track metadata")
 let beforeAudioRateLimit = limitedRequests
 do { _ = try limitedClient.audioStream(for:nativeResults[0],cancellation:SoundCloudCancellation()); fatalError("Audio rate limit ignored") }
 catch SoundCloudError.rateLimited {
@@ -750,16 +794,15 @@ let hlsServiceClient = SoundCloudSearchClient(cache: nativeCache, clientID: Stri
     return (Data((url.lastPathComponent + ";").utf8), HTTPURLResponse(url:url,statusCode:200,httpVersion:nil,headerFields:nil)!)
 }
 let hlsService = SoundCloudService(helper: root.appendingPathComponent("no-helper"), ffmpeg: remuxScript, cache: nativeCache, searchClient: hlsServiceClient)
-var hlsStages: [String] = []
-let hlsFile = try hlsService.download(nativeResults[0], directory: root.appendingPathComponent("HLSAudio"), cancellation: SoundCloudCancellation()) { stage in
-    hlsLock.lock(); hlsStages.append(stage); hlsLock.unlock()
-}
+var hlsFractions: [Double] = []
+let hlsFile = try hlsService.download(nativeResults[0], directory: root.appendingPathComponent("HLSAudio"), cancellation: SoundCloudCancellation(),
+                                      stage: { _ in }, progress: { value in hlsLock.lock(); hlsFractions.append(value); hlsLock.unlock() })
 let remuxArguments = try String(contentsOf: remuxLog, encoding: .utf8)
 expect(String(data: try! Data(contentsOf: hlsFile), encoding: .utf8) == expectedHLS && hlsFile.pathExtension == "m4a",
        "a SoundCloud HLS track arrives as one M4A built from its parallel segments")
 expect(remuxArguments.contains("file") && !remuxArguments.contains("https,tls,tcp") && remuxArguments.contains("copy"),
        "FFmpeg only rewraps the local joined file without network access or re-encoding")
-expect(hlsStages.contains { $0.hasSuffix("100%") }, "native HLS reports download progress")
+expect(hlsFractions.last == 1 && zip(hlsFractions, hlsFractions.dropFirst()).allSatisfy { $0 < $1 }, "native HLS reports steadily rising download progress")
 expect((try! FileManager.default.contentsOfDirectory(atPath: hlsFile.deletingLastPathComponent().deletingLastPathComponent().path)) == ["Prepared"],
        "the joined segment file is removed once the M4A is ready")
 
@@ -1004,12 +1047,16 @@ if CommandLine.arguments.count > 1 {
     let directConfig = URLSessionConfiguration.ephemeral; directConfig.protocolClasses = [GoogleVideoFixture.self]
     let directService = YouTubeService(helper:directHelper,ffmpeg:ffmpegYT,runtime:URL(fileURLWithPath:"/usr/bin/true"),cache:root.appendingPathComponent("YTDirect"),fallback:nil,format:{ .m4a },transferConfiguration:directConfig)
     _ = try directService.resolve("https://youtu.be/"+ytID,cancellation:SoundCloudCancellation())
-    let directFileYT = try directService.download(ytTrack,directory:root.appendingPathComponent("YTDirectDownload"),cancellation:SoundCloudCancellation(),stage:{ _ in })
+    var directFractions: [Double] = []
+    let directFileYT = try directService.download(ytTrack,directory:root.appendingPathComponent("YTDirectDownload"),cancellation:SoundCloudCancellation(),
+                                                  stage:{ _ in },progress:{ directFractions.append($0) })
     let directArguments = try String(contentsOf: directLog, encoding: .utf8).split(separator: "\n")
     expect(directFileYT.pathExtension == "m4a" && (try! ImportServices().playable(directFileYT)) && GoogleVideoFixture.ranges.allSatisfy { $0.hasPrefix("bytes=0-") },
            "the direct YouTube stream is fetched by byte range and saved as playable M4A")
     expect(directArguments.filter { $0 == "--dump-single-json" }.count == 1 && !directArguments.contains("--load-info-json"),
            "with a direct stream yt-dlp runs only once, for the link check")
+    expect(directFractions.last == 1, "the direct YouTube transfer reports its progress")
+    expect(m4aLog.contains("--progress-template"), "yt-dlp downloads report machine-readable progress")
     var ytImports = 0, ytCloudRequests = 0
     var ytServices = services
     ytServices.playable = ImportServices().playable
@@ -1171,6 +1218,22 @@ if CommandLine.arguments.count > 1 {
     let m4aFallbackService = YouTubeService(helper:URL(fileURLWithPath:"/usr/bin/false"),ffmpeg:URL(fileURLWithPath:"/opt/homebrew/bin/ffmpeg"),runtime:URL(fileURLWithPath:"/usr/bin/true"),fallback:client,format:{ .m4a })
     let m4aFallbackFile = try m4aFallbackService.download(fallbackTrack,directory:root.appendingPathComponent("RelayDownloadsM4A"),cancellation:SoundCloudCancellation(),stage:{ _ in })
     expect(m4aFallbackFile.pathExtension == "m4a" && (try! ImportServices().playable(m4aFallbackFile)),"fallback AAC audio is rewrapped as M4A without re-encoding")
+    // A slow extractor is overtaken by the fallback; a quick one answers alone.
+    func relayScript(_ name: String, _ body: String) throws -> URL {
+        let url = root.appendingPathComponent(name)
+        try ("#!/bin/sh\n" + body).write(to: url, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        return url
+    }
+    let quotedJSON = String(data: ytJSON, encoding: .utf8)!.replacingOccurrences(of: "'", with: "'\\''")
+    let slowExtractor = try relayScript("youtube-slow", "/bin/sleep 3\n/usr/bin/printf '%s\\n' '\(quotedJSON)'\n")
+    let quickExtractor = try relayScript("youtube-quick", "/usr/bin/printf '%s\\n' '\(quotedJSON)'\n")
+    let racing = YouTubeService(helper:slowExtractor,ffmpeg:URL(fileURLWithPath:"/opt/homebrew/bin/ffmpeg"),runtime:URL(fileURLWithPath:"/usr/bin/true"),cache:root.appendingPathComponent("YTRace"),fallback:client,format:{ .mp3 },raceDelay:{ 0.2 })
+    let raceStarted = Date()
+    let raced = try racing.resolve("https://youtu.be/"+ytID,cancellation:SoundCloudCancellation())
+    expect(raced.fallbackEndpoint == relayEndpoint && Date().timeIntervalSince(raceStarted) < 2, "a slow extractor is overtaken by the fallback after a short delay")
+    let quickService = YouTubeService(helper:quickExtractor,ffmpeg:URL(fileURLWithPath:"/opt/homebrew/bin/ffmpeg"),runtime:URL(fileURLWithPath:"/usr/bin/true"),cache:root.appendingPathComponent("YTQuick"),fallback:client,format:{ .mp3 },raceDelay:{ 2 })
+    expect(try! quickService.resolve("https://youtu.be/"+ytID,cancellation:SoundCloudCancellation()) == ytTrack, "a quick extractor wins the race without the fallback")
     var refreshCalls = 0, streamCalls = 0
     let refreshing = YouTubeFallback(endpoint:relayEndpoint,transport:{ request,token,limit,destination in
         if let destination {
@@ -1238,5 +1301,25 @@ YouTubeHTTPFixture.status = 429
 let limitedFile = root.appendingPathComponent("limited.m4a")
 do { _ = try YouTubeHTTPTransfer.run(credentialRequest,cancellation:SoundCloudCancellation(),maximumBytes:100,destination:limitedFile,endpoint:relayEndpoint,configuration:httpFixtureConfig);fatalError("Rate limit accepted") }
 catch { expect((error as? YouTubeHTTPError)?.status == 429 && !FileManager.default.fileExists(atPath:limitedFile.path),"rate limits stop the transfer and never save an error page as audio") }
+
+// Links from any field, paste or drop go to the source they belong to.
+expect(LinkRoute.detect("https://youtu.be/\(ytID)?si=share") == .youTube("https://youtu.be/\(ytID)?si=share")
+       && LinkRoute.detect(" https://soundcloud.com/artist/song ") == .soundCloud("https://soundcloud.com/artist/song")
+       && LinkRoute.detect("https://on.soundcloud.com/abc") == .soundCloud("https://on.soundcloud.com/abc"),
+       "YouTube and SoundCloud track links are routed to their own tabs")
+expect(LinkRoute.detect("тёмный принц") == nil && LinkRoute.forInput("тёмный принц") == .soundCloud("тёмный принц"),
+       "plain words are not treated as links but a search field sends them to SoundCloud")
+expect(LinkRoute.detect("https://example.com/song") == nil && LinkRoute.forInput("https://youtube.com/playlist?list=PL1") == nil
+       && LinkRoute.detect("https://soundcloud.com/artist/sets/album") == nil,
+       "foreign sites, playlists and albums are never routed")
+
+let progressLog = root.appendingPathComponent("progress.log")
+try Data("[download] noise\nMDPROGRESS 50 200\nMDPROGRESS 10 NA\nMDPROGRESS 100 2".utf8).write(to: progressLog)
+var tailed: [Double] = []
+let tail = ProgressTail(files: [progressLog, root.appendingPathComponent("missing.log")]) { tailed.append($0) }
+tail.poll()
+let appender = try FileHandle(forWritingTo: progressLog); try appender.seekToEnd(); try appender.write(contentsOf: Data("00\n".utf8)); try appender.close()
+tail.poll(); tail.poll()
+expect(tailed == [0.25, 0.5], "yt-dlp progress is read from complete new lines only, ignoring unknown totals")
 
 print("\(checks) checks passed. No personal Music library was modified.")

@@ -4,9 +4,11 @@
     {
       "name": "yt-dlp",
       "version": "2026.10.26",
-      "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.10.26/yt-dlp_macos",
-      "sha256": "0f922c15ccc0b83eefa1c8bc9104e434318c4bf16e408e1ee93b7745a6efe0aa",
-      "executableSHA256": "0f922c15ccc0b83eefa1c8bc9104e434318c4bf16e408e1ee93b7745a6efe0aa"
+      "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.10.26/yt-dlp_macos.zip",
+      "sha256": "20d98fa608998eff87d1d35a6e9fb65e4b874639a6cc89addc19da3becde3ef1",
+      "archiveDirectory": true,
+      "executable": "yt-dlp_macos",
+      "executableSHA256": "e8faad7f104d09799be235151c0038056664634732c82307eef78e58b8274a41"
     },
     {
       "name": "deno-arm64",

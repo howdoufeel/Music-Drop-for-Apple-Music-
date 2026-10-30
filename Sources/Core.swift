@@ -90,11 +90,61 @@ enum FileTools {
         return destination
     }
 
+    /// yt-dlp ships unpacked, so it starts without extracting itself to a temporary folder on every run.
+    /// A single-file build from an older installer is still accepted.
+    static func extractor(in resources: URL) -> URL {
+        let folder = resources.appendingPathComponent("Helpers/yt-dlp", isDirectory: true)
+        var isDirectory: ObjCBool = false
+        if FileManager.default.fileExists(atPath: folder.path, isDirectory: &isDirectory), !isDirectory.boolValue {
+            return URL(fileURLWithPath: folder.path)
+        }
+        return folder.appendingPathComponent("yt-dlp_macos")
+    }
+
     static func appleScriptLiteral(_ value: String) -> String {
         "\"" + value.replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
             .replacingOccurrences(of: "\r", with: "\\r")
             .replacingOccurrences(of: "\n", with: "\\n") + "\""
+    }
+}
+
+/// Follows yt-dlp's machine-readable progress lines while it writes them to its log files.
+final class ProgressTail {
+    static let arguments = ["--progress", "--newline", "--progress-template",
+                            "download:MDPROGRESS %(progress.downloaded_bytes)s %(progress.total_bytes,progress.total_bytes_estimate)s"]
+    private let files: [URL]
+    private var offsets: [URL: UInt64] = [:]
+    private let report: (Double) -> Void
+
+    init(files: [URL], report: @escaping (Double) -> Void) {
+        self.files = files
+        self.report = report
+    }
+
+    /// Reads only complete new lines and reports the newest fraction.
+    func poll() {
+        var latest: Double?
+        for file in files {
+            guard let handle = try? FileHandle(forReadingFrom: file) else { continue }
+            defer { try? handle.close() }
+            let offset = offsets[file] ?? 0
+            guard (try? handle.seek(toOffset: offset)) != nil, let data = try? handle.readToEnd(), !data.isEmpty,
+                  let end = data.lastIndex(of: UInt8(ascii: "\n")) else { continue }
+            let complete = data[data.startIndex...end]
+            offsets[file] = offset + UInt64(complete.count)
+            for line in String(decoding: complete, as: UTF8.self).split(whereSeparator: \.isNewline) {
+                if let value = Self.fraction(line) { latest = value }
+            }
+        }
+        if let latest { report(latest) }
+    }
+
+    static func fraction(_ line: Substring) -> Double? {
+        let parts = line.split(separator: " ")
+        guard let marker = parts.firstIndex(of: "MDPROGRESS"), parts.count > marker + 2,
+              let done = Double(parts[marker + 1]), let total = Double(parts[marker + 2]), total > 0 else { return nil }
+        return min(1, max(0, done / total))
     }
 }
 

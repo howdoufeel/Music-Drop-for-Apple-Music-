@@ -17,6 +17,8 @@ ROOT = Path(__file__).resolve().parents[1]
 HELPERS = ROOT / 'Resources' / 'Helpers'
 MANIFEST = HELPERS / 'dependencies.json'
 MAX_DOWNLOAD = 200_000_000
+MAX_UNPACKED = 400_000_000
+MARKER = '.archive-sha256'
 
 
 def digest(path):
@@ -29,6 +31,47 @@ def digest(path):
 
 def valid(path, expected):
     return path.is_file() and digest(path) == expected
+
+
+def installed(item):
+    """An unpacked folder counts only when its marker names the verified archive."""
+    target = HELPERS / item['name']
+    if not item.get('archiveDirectory'):
+        return valid(target, item['executableSHA256']) and os.access(target, os.X_OK)
+    executable = target / item['executable']
+    marker = target / MARKER
+    return (target.is_dir() and marker.is_file() and marker.read_text().strip() == item['sha256']
+            and valid(executable, item['executableSHA256']) and os.access(executable, os.X_OK))
+
+
+def unpack(archive_path, destination):
+    """Extracts a whole release archive; absolute paths, parent references and links are refused."""
+    total = 0
+    with zipfile.ZipFile(archive_path) as archive:
+        for info in archive.infolist():
+            name = Path(info.filename)
+            mode = info.external_attr >> 16
+            if name.is_absolute() or '..' in name.parts or (mode & 0o170000) == 0o120000:
+                raise RuntimeError('Unsafe archive member: ' + info.filename)
+            total += info.file_size
+            if total > MAX_UNPACKED:
+                raise RuntimeError('Archive exceeds the unpacked size limit')
+            target = destination / name
+            if info.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with archive.open(info) as source, target.open('wb') as output:
+                shutil.copyfileobj(source, output)
+            target.chmod(0o755 if mode & 0o111 else 0o644)
+
+
+def replace(staged, target):
+    if target.is_dir() and not target.is_symlink():
+        shutil.rmtree(target)
+    elif target.exists() or target.is_symlink():
+        target.unlink()
+    os.replace(staged, target)
 
 
 def download(item, destination):
@@ -58,15 +101,25 @@ def download(item, destination):
 
 def install(item, cache):
     target = HELPERS / item['name']
-    if valid(target, item['executableSHA256']):
-        target.chmod(0o755)
+    if installed(item):
         return item['name'] + ': verified'
     cached = cache / (item['sha256'] + '.download')
     if not valid(cached, item['sha256']):
         download(item, cached)
-    # Extract only the explicitly pinned member; archive paths never become destinations.
     with tempfile.TemporaryDirectory(prefix='.download-', dir=HELPERS) as work:
         staged = Path(work) / item['name']
+        if item.get('archiveDirectory'):
+            # Unpacked builds start without extracting themselves to a temporary folder on every run.
+            staged.mkdir()
+            unpack(cached, staged)
+            executable = staged / item['executable']
+            if not valid(executable, item['executableSHA256']):
+                raise RuntimeError('Executable SHA-256 mismatch: ' + item['name'])
+            executable.chmod(0o755)
+            (staged / MARKER).write_text(item['sha256'] + '\n')
+            replace(staged, target)
+            return item['name'] + ': installed and verified'
+        # Extract only the explicitly pinned member; archive paths never become destinations.
         if 'archiveMember' in item:
             with zipfile.ZipFile(cached) as archive:
                 info = archive.getinfo(item['archiveMember'])
@@ -79,7 +132,7 @@ def install(item, cache):
         if not valid(staged, item['executableSHA256']):
             raise RuntimeError('Executable SHA-256 mismatch: ' + item['name'])
         staged.chmod(0o755)
-        os.replace(staged, target)
+        replace(staged, target)
     return item['name'] + ': installed and verified'
 
 
@@ -97,9 +150,10 @@ def main():
             raise RuntimeError('Invalid dependency name')
         if not item['url'].startswith('https://github.com/'):
             raise RuntimeError('Dependencies must come from their pinned GitHub releases')
+        if item.get('archiveDirectory') and (not item.get('executable') or Path(item['executable']).name != item['executable']):
+            raise RuntimeError('Invalid dependency executable')
     if args.check:
-        missing = [item['name'] for item in items if not valid(HELPERS / item['name'], item['executableSHA256'])
-                   or not os.access(HELPERS / item['name'], os.X_OK)]
+        missing = [item['name'] for item in items if not installed(item)]
         if missing:
             print('Missing or invalid: ' + ', '.join(missing), file=sys.stderr)
             return 1

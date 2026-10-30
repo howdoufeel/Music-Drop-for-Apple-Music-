@@ -27,6 +27,15 @@ enum YouTubeAudioFormat: String, CaseIterable, Identifiable {
     var selector: String { self == .m4a ? "bestaudio[ext=m4a]/bestaudio/best" : "bestaudio/best" }
 }
 
+/// When the extractor is slow, the fallback starts alongside it after this delay.
+/// Turned off, the fallback is used only after the extractor fails.
+enum YouTubeFallbackRace {
+    static let defaultsKey = "YouTubeFallbackRace"
+    static var storedDelay: TimeInterval? {
+        UserDefaults.standard.object(forKey: defaultsKey) as? Bool == false ? nil : 5
+    }
+}
+
 /// Everything one extractor run learns about a video, reused by the download.
 struct YouTubeMediaInfo {
     let track: YouTubeTrack
@@ -43,10 +52,17 @@ protocol YouTubeProviding {
     func resolve(_ input: String, cancellation: SoundCloudCancellation) throws -> YouTubeTrack
     func download(_ track: YouTubeTrack, directory: URL, cancellation: SoundCloudCancellation,
                   stage: @escaping (String) -> Void) throws -> URL
+    /// Like `download`, also reporting the fraction transferred once the size is known.
+    func download(_ track: YouTubeTrack, directory: URL, cancellation: SoundCloudCancellation,
+                  stage: @escaping (String) -> Void, progress: @escaping (Double) -> Void) throws -> URL
 }
 
 extension YouTubeProviding {
     func preview(_ input: String, cancellation: SoundCloudCancellation) -> YouTubeTrack? { nil }
+    func download(_ track: YouTubeTrack, directory: URL, cancellation: SoundCloudCancellation,
+                  stage: @escaping (String) -> Void, progress: @escaping (Double) -> Void) throws -> URL {
+        try download(track, directory: directory, cancellation: cancellation, stage: stage)
+    }
 }
 
 final class YouTubeService: YouTubeProviding {
@@ -61,14 +77,17 @@ final class YouTubeService: YouTubeProviding {
     private let fallback: YouTubeFallback?
     private let format: () -> YouTubeAudioFormat
     private let transferConfiguration: URLSessionConfiguration?
+    private let raceDelay: () -> TimeInterval?
     init(helper: URL? = nil, ffmpeg: URL? = nil, runtime: URL? = nil, cache: URL? = nil,
          fallback: YouTubeFallback? = YouTubeFallback(), format: @escaping () -> YouTubeAudioFormat = { .stored },
-         transferConfiguration: URLSessionConfiguration? = nil) {
+         transferConfiguration: URLSessionConfiguration? = nil,
+         raceDelay: @escaping () -> TimeInterval? = { YouTubeFallbackRace.storedDelay }) {
         self.fallback = fallback
         self.format = format
         self.transferConfiguration = transferConfiguration
+        self.raceDelay = raceDelay
         let resources = Bundle.main.resourceURL ?? Bundle.main.bundleURL
-        self.helper = helper ?? resources.appendingPathComponent("Helpers/yt-dlp")
+        self.helper = helper ?? FileTools.extractor(in: resources)
         self.ffmpeg = ffmpeg ?? ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"]
             .map { URL(fileURLWithPath: $0) }.first { FileManager.default.isExecutableFile(atPath: $0.path) }
         #if arch(arm64)
@@ -188,6 +207,9 @@ final class YouTubeService: YouTubeProviding {
         let id = try Self.videoID(input)
         let format = self.format()
         routeLock.lock(); let directAvailable = Date() >= directUnavailableUntil; routeLock.unlock()
+        if directAvailable, let fallback, let delay = raceDelay() {
+            return try race(id, format: format, delay: delay, fallback: fallback, cancellation: cancellation)
+        }
         if directAvailable || fallback == nil {
             do {
                 return try mediaInfo(id, format: format, refresh: false, cancellation: cancellation).info.track
@@ -199,6 +221,59 @@ final class YouTubeService: YouTubeProviding {
         }
         guard let fallback else { throw DropError.message("YouTube сейчас не предоставляет аудио без входа.") }
         return try fallback.resolve(id, cancellation: cancellation, preferAAC: format == .m4a).track
+    }
+
+    /// The extractor starts first; if it is still busy after `delay`, the fallback runs alongside
+    /// and the first usable answer wins. An extractor failure still switches routes for a while.
+    private func race(_ id: String, format: YouTubeAudioFormat, delay: TimeInterval, fallback: YouTubeFallback,
+                      cancellation: SoundCloudCancellation) throws -> YouTubeTrack {
+        final class Outcome {
+            let lock = NSLock()
+            let changed = DispatchSemaphore(value: 0)
+            var track: YouTubeTrack?
+            var directError: Error?, fallbackError: Error?
+            var fallbackStarted = false
+        }
+        let outcome = Outcome()
+        let direct = SoundCloudCancellation(), relay = SoundCloudCancellation()
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let track = try self.mediaInfo(id, format: format, refresh: false, cancellation: direct).info.track
+                outcome.lock.lock(); if outcome.track == nil { outcome.track = track }; outcome.lock.unlock()
+            } catch {
+                if !direct.isCancelled {
+                    self.routeLock.lock(); self.directUnavailableUntil = Date().addingTimeInterval(900); self.routeLock.unlock()
+                }
+                outcome.lock.lock(); outcome.directError = error; outcome.lock.unlock()
+            }
+            outcome.changed.signal()
+        }
+        let started = Date()
+        while true {
+            if cancellation.isCancelled { direct.cancel(); relay.cancel(); throw SoundCloudError.cancelled }
+            outcome.lock.lock()
+            if let track = outcome.track {
+                outcome.lock.unlock()
+                if track.fallbackEndpoint == nil { relay.cancel() } else { direct.cancel() }
+                return track
+            }
+            if outcome.directError != nil, let error = outcome.fallbackError { outcome.lock.unlock(); throw error }
+            let shouldStart = !outcome.fallbackStarted && (outcome.directError != nil || Date().timeIntervalSince(started) >= delay)
+            if shouldStart { outcome.fallbackStarted = true }
+            outcome.lock.unlock()
+            if shouldStart {
+                DispatchQueue.global(qos: .userInitiated).async {
+                    do {
+                        let track = try fallback.resolve(id, cancellation: relay, preferAAC: format == .m4a).track
+                        outcome.lock.lock(); if outcome.track == nil { outcome.track = track }; outcome.lock.unlock()
+                    } catch {
+                        outcome.lock.lock(); outcome.fallbackError = error; outcome.lock.unlock()
+                    }
+                    outcome.changed.signal()
+                }
+            }
+            _ = outcome.changed.wait(timeout: .now() + 0.05)
+        }
     }
 
     /// One extractor run per video: the check and the later download share its result,
@@ -250,6 +325,11 @@ final class YouTubeService: YouTubeProviding {
 
     func download(_ track: YouTubeTrack, directory: URL, cancellation: SoundCloudCancellation,
                   stage: @escaping (String) -> Void) throws -> URL {
+        try download(track, directory: directory, cancellation: cancellation, stage: stage, progress: { _ in })
+    }
+
+    func download(_ track: YouTubeTrack, directory: URL, cancellation: SoundCloudCancellation,
+                  stage: @escaping (String) -> Void, progress: @escaping (Double) -> Void) throws -> URL {
         _ = try Self.videoID(track.url.absoluteString)
         guard let ffmpeg else { throw DropError.message("Для подготовки аудио нужен FFmpeg в /opt/homebrew/bin или /usr/local/bin.") }
         if cancellation.isCancelled { throw SoundCloudError.cancelled }
@@ -266,7 +346,8 @@ final class YouTubeService: YouTubeProviding {
         } else {
             do {
                 try validateTools(needsEncoder: true)
-                source = try directSource(track.id, format: format, working: working, cancellation: cancellation, stage: stage)
+                source = try directSource(track.id, format: format, working: working, cancellation: cancellation,
+                                          stage: stage, progress: progress)
             } catch {
                 if cancellation.isCancelled { throw SoundCloudError.cancelled }
                 guard let fallback else { throw error }
@@ -290,7 +371,7 @@ final class YouTubeService: YouTubeProviding {
     /// Prefers the stream URL from the earlier check; yt-dlp then reuses the same JSON
     /// instead of contacting YouTube again. A stale cached result is refreshed once.
     private func directSource(_ id: String, format: YouTubeAudioFormat, working: URL, cancellation: SoundCloudCancellation,
-                              stage: @escaping (String) -> Void) throws -> URL {
+                              stage: @escaping (String) -> Void, progress: @escaping (Double) -> Void) throws -> URL {
         var lastError: Error?
         for attempt in 0...1 {
             let (info, cached) = try mediaInfo(id, format: format, refresh: attempt > 0, cancellation: cancellation)
@@ -298,7 +379,7 @@ final class YouTubeService: YouTubeProviding {
             if info.audioURL != nil, let ext = info.fileExtension {
                 let target = working.appendingPathComponent("audio." + ext)
                 do {
-                    try fetchDirect(info, to: target, cancellation: cancellation, stage: stage)
+                    try fetchDirect(info, to: target, cancellation: cancellation, progress: progress)
                     return target
                 } catch {
                     if cancellation.isCancelled { throw SoundCloudError.cancelled }
@@ -307,7 +388,7 @@ final class YouTubeService: YouTubeProviding {
                 }
             }
             do {
-                return try downloadWithInfo(info, format: format, working: working, cancellation: cancellation)
+                return try downloadWithInfo(info, format: format, working: working, cancellation: cancellation, progress: progress)
             } catch {
                 if cancellation.isCancelled { throw SoundCloudError.cancelled }
                 lastError = error
@@ -319,22 +400,21 @@ final class YouTubeService: YouTubeProviding {
 
     /// Splits a known-size stream into ranges fetched in parallel, each within YouTube's chunk size.
     private func fetchDirect(_ info: YouTubeMediaInfo, to destination: URL, cancellation: SoundCloudCancellation,
-                             stage: @escaping (String) -> Void) throws {
+                             progress: @escaping (Double) -> Void) throws {
         guard let url = info.audioURL, let total = info.contentLength else {
             throw DropError.message("Размер аудио YouTube неизвестен.")
         }
         guard total <= 200_000_000 else { throw DropError.message("Аудио превышает ограничение 200 МБ.") }
         let ranges = Self.ranges(total: total)
-        var reported = -1
+        var reported = 0
         let lock = NSLock()
         try BoundedFetch.with(allowed: Self.isGoogleVideo, configuration: transferConfiguration ?? .ephemeral) { fetch in
             try ParallelDownload.run(count: ranges.count, concurrency: 4, destination: destination, maximumBytes: 200_000_000,
                                      cancellation: cancellation, progress: { done, all in
-                let percent = done * 100 / max(1, all)
                 lock.lock(); defer { lock.unlock() }
-                guard all > 1, percent / 10 != reported / 10 else { return }
-                reported = percent
-                stage("Скачиваем аудио с YouTube… \(percent)%")
+                guard done > reported else { return }
+                reported = done
+                progress(Double(done) / Double(max(1, all)))
             }) { index in
                 let range = ranges[index]
                 var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)
@@ -357,14 +437,14 @@ final class YouTubeService: YouTubeProviding {
     }
 
     private func downloadWithInfo(_ info: YouTubeMediaInfo, format: YouTubeAudioFormat, working: URL,
-                                  cancellation: SoundCloudCancellation) throws -> URL {
+                                  cancellation: SoundCloudCancellation, progress: @escaping (Double) -> Void) throws -> URL {
         let infoFile = working.appendingPathComponent("info.json")
         try info.json.write(to: infoFile)
         defer { try? FileManager.default.removeItem(at: infoFile) }
-        let output = try run(helper, arguments: arguments + [
+        let output = try run(helper, arguments: arguments.filter { $0 != "--no-progress" } + ProgressTail.arguments + [
             "--load-info-json", infoFile.path, "-f", format.selector, "--concurrent-fragments", "4", "--max-filesize", "200M",
             "--no-simulate", "--print", "after_move:filepath", "-o", working.appendingPathComponent("audio.%(ext)s").path
-        ], cancellation: cancellation, timeout: 900)
+        ], cancellation: cancellation, timeout: 900, progress: progress)
         let path = String(data: output, encoding: .utf8)?.split(whereSeparator: \.isNewline).last.map(String.init) ?? ""
         let downloaded = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath()
         guard downloaded.path.hasPrefix(working.standardizedFileURL.resolvingSymlinksInPath().path + "/") else {
@@ -428,7 +508,8 @@ final class YouTubeService: YouTubeProviding {
     }
 
     /// Output files avoid deadlocks; arguments never pass through a shell.
-    private func run(_ executable: URL, arguments: [String], cancellation: SoundCloudCancellation, timeout: TimeInterval) throws -> Data {
+    private func run(_ executable: URL, arguments: [String], cancellation: SoundCloudCancellation, timeout: TimeInterval,
+                     progress: ((Double) -> Void)? = nil) throws -> Data {
         if cancellation.isCancelled { throw SoundCloudError.cancelled }
         let fm = FileManager.default
         let directory = fm.temporaryDirectory.appendingPathComponent("musicdrop-youtube-" + UUID().uuidString)
@@ -445,6 +526,7 @@ final class YouTubeService: YouTubeProviding {
         process.environment = environment
         process.standardOutput = output; process.standardError = error; process.standardInput = FileHandle.nullDevice
         try process.run(); cancellation.attach(process)
+        let tail = progress.map { ProgressTail(files: [outputURL, errorURL], report: $0) }
         let deadline = Date().addingTimeInterval(timeout)
         while process.isRunning {
             if cancellation.isCancelled || Date() > deadline {
@@ -457,6 +539,7 @@ final class YouTubeService: YouTubeProviding {
                 throw DropError.message("YouTube долго не отвечает. Проверь соединение и повтори.")
             }
             Thread.sleep(forTimeInterval: 0.1)
+            tail?.poll()
         }
         process.waitUntilExit()
         if cancellation.isCancelled { throw SoundCloudError.cancelled }

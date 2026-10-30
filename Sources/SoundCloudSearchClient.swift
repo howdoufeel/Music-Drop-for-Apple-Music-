@@ -86,6 +86,14 @@ final class SoundCloudSearchClient {
     /// Resolve only the selected compatible stream; no audio process or artwork probes.
     func audioStream(for track: SoundCloudTrack, cancellation: SoundCloudCancellation) throws -> SoundCloudAudioSource? {
         guard track.id.range(of: "^[0-9]+$", options: .regularExpression) != nil else { return nil }
+        if let hint = track.stream {
+            // Search results already list the streams; a stale authorization falls back to fresh metadata.
+            let clientID = try credential(refresh: false, cancellation: cancellation)
+            if let source = try resolveStream(hint.transcoding, fileExtension: hint.fileExtension, isHLS: hint.isHLS,
+                                              authorization: hint.authorization, clientID: clientID, cancellation: cancellation) {
+                return source
+            }
+        }
         for attempt in 0...1 {
             let clientID = try credential(refresh: attempt > 0, cancellation: cancellation)
             var metadataURL = URLComponents(string: "https://api-v2.soundcloud.com/tracks/" + track.id)!
@@ -97,20 +105,36 @@ final class SoundCloudSearchClient {
                   let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                   (root["id"] as? NSNumber)?.stringValue == track.id || root["id"] as? String == track.id,
                   let candidate = Self.nativeCandidate(root) else { return nil }
-            var streamURL = URLComponents(url: candidate.url, resolvingAgainstBaseURL: false)!
-            streamURL.queryItems = (streamURL.queryItems ?? []).filter { !["client_id", "track_authorization"].contains($0.name) }
-                + [URLQueryItem(name: "client_id", value: clientID)]
-            if let authorization = root["track_authorization"] as? String {
-                streamURL.queryItems?.append(URLQueryItem(name: "track_authorization", value: authorization))
-            }
-            let (streamData, streamResponse) = try request(streamURL.url!, cancellation: cancellation)
-            if streamResponse.statusCode == 429 { throw SoundCloudError.rateLimited }
-            guard streamResponse.statusCode == 200,
-                  let stream = try JSONSerialization.jsonObject(with: streamData) as? [String: Any],
-                  let rawURL = stream["url"] as? String, let url = URL(string: rawURL), Self.isMediaURL(url) else { return nil }
-            return SoundCloudAudioSource(url: url, fileExtension: candidate.fileExtension, isHLS: candidate.isHLS)
+            return try resolveStream(candidate.url, fileExtension: candidate.fileExtension, isHLS: candidate.isHLS,
+                                     authorization: root["track_authorization"] as? String, clientID: clientID, cancellation: cancellation)
         }
         return nil
+    }
+
+    /// Exchanges a transcoding endpoint for the signed media URL.
+    private func resolveStream(_ transcoding: URL, fileExtension: String, isHLS: Bool, authorization: String?, clientID: String,
+                               cancellation: SoundCloudCancellation) throws -> SoundCloudAudioSource? {
+        var streamURL = URLComponents(url: transcoding, resolvingAgainstBaseURL: false)!
+        streamURL.queryItems = (streamURL.queryItems ?? []).filter { !["client_id", "track_authorization"].contains($0.name) }
+            + [URLQueryItem(name: "client_id", value: clientID)]
+        if let authorization {
+            streamURL.queryItems?.append(URLQueryItem(name: "track_authorization", value: authorization))
+        }
+        let (streamData, streamResponse) = try request(streamURL.url!, cancellation: cancellation)
+        if streamResponse.statusCode == 429 { throw SoundCloudError.rateLimited }
+        guard streamResponse.statusCode == 200,
+              let stream = (try? JSONSerialization.jsonObject(with: streamData)) as? [String: Any],
+              let rawURL = stream["url"] as? String, let url = URL(string: rawURL), Self.isMediaURL(url) else { return nil }
+        return SoundCloudAudioSource(url: url, fileExtension: fileExtension, isHLS: isHLS)
+    }
+
+    /// Opens the connection ahead of the first search and, on a fresh install,
+    /// discovers the public identifier before anyone waits for it.
+    func prewarm() {
+        let token = SoundCloudCancellation()
+        credentialLock.lock(); let cached = publicClientID; credentialLock.unlock()
+        if cached == nil { _ = try? credential(refresh: false, cancellation: token) }
+        _ = try? request(URL(string: "https://api-v2.soundcloud.com/")!, method: "HEAD", timeout: 5, cancellation: token)
     }
 
     /// SoundCloud serves full tracks as many short HLS segments. Fetching several at once
@@ -275,7 +299,18 @@ final class SoundCloudSearchClient {
             track["thumbnail"] = item["artwork_url"] as? String ?? user["avatar_url"] as? String
             return track
         }
-        return try SoundCloudService.parseTracks(JSONSerialization.data(withJSONObject: ["entries": normalized]))
+        var hints: [String: SoundCloudStreamHint] = [:]
+        for item in items.prefix(15) where item["kind"] as? String == "track" {
+            let id = (item["id"] as? NSNumber)?.stringValue ?? item["id"] as? String ?? ""
+            guard let candidate = nativeCandidate(item) else { continue }
+            hints[id] = SoundCloudStreamHint(transcoding: candidate.url, fileExtension: candidate.fileExtension,
+                                             isHLS: candidate.isHLS, authorization: item["track_authorization"] as? String)
+        }
+        return try SoundCloudService.parseTracks(JSONSerialization.data(withJSONObject: ["entries": normalized])).map {
+            var track = $0
+            track.stream = hints[track.id]
+            return track
+        }
     }
 
     private static func isClientID(_ value: String) -> Bool {
@@ -302,7 +337,6 @@ final class SoundCloudSearchClient {
         let idRegex = try NSRegularExpression(pattern: #"client_id\s*:\s*"([a-zA-Z0-9]{32})""#)
         let deadline = Date().addingTimeInterval(18)
         let candidates = Array(scripts.reversed().prefix(12))
-        var partialAssets: [URL] = []
         // The website's configuration is normally at the start of its main
         // asset. A range request avoids downloading megabytes of application JS.
         func readID(_ data: Data) -> String? {
@@ -319,15 +353,47 @@ final class SoundCloudSearchClient {
             }
             return value
         }
-        for url in candidates {
-            if cancellation.isCancelled { throw SoundCloudError.cancelled }
-            guard Date() < deadline else { break }
-            let data: Data, response: HTTPURLResponse
-            do { (data, response) = try request(url, timeout: 4, range: "bytes=0-65535", cancellation: cancellation) }
-            catch { if cancellation.isCancelled { throw SoundCloudError.cancelled }; continue }
-            if let value = readID(data) { return save(value) }
-            if response.statusCode == 206 { partialAssets.append(url) }
+        // Probe several scripts at once; the first that names the identifier wins.
+        final class Probe {
+            let lock = NSLock()
+            let done = DispatchSemaphore(value: 0)
+            var next = 0
+            var found: String?
+            var partial: [Int] = []
         }
+        let probe = Probe()
+        let group = DispatchGroup()
+        for _ in 0..<min(6, candidates.count) {
+            group.enter()
+            DispatchQueue.global(qos: .userInitiated).async {
+                defer { group.leave() }
+                while true {
+                    probe.lock.lock()
+                    guard probe.found == nil, probe.next < candidates.count, !cancellation.isCancelled, Date() < deadline else {
+                        probe.lock.unlock(); return
+                    }
+                    let index = probe.next
+                    probe.next += 1
+                    probe.lock.unlock()
+                    guard let reply = try? self.request(candidates[index], timeout: 4, range: "bytes=0-65535",
+                                                        cancellation: cancellation) else { continue }
+                    let (data, response) = reply
+                    let value = readID(data)
+                    probe.lock.lock()
+                    if let value, probe.found == nil { probe.found = value; probe.done.signal() }
+                    if value == nil, response.statusCode == 206 { probe.partial.append(index) }
+                    probe.lock.unlock()
+                }
+            }
+        }
+        group.notify(queue: .global()) { probe.done.signal() }
+        probe.done.wait()
+        if cancellation.isCancelled { throw SoundCloudError.cancelled }
+        probe.lock.lock()
+        let found = probe.found
+        let partialAssets = probe.partial.sorted().map { candidates[$0] }
+        probe.lock.unlock()
+        if let found { return save(found) }
         // If SoundCloud moves the configuration, allow a bounded full-asset fallback.
         for url in partialAssets.prefix(3) {
             if cancellation.isCancelled { throw SoundCloudError.cancelled }
