@@ -882,6 +882,37 @@ if CommandLine.arguments.count > 1 {
     runningCancellation.cancel()
     expect(cancellationFinished.wait(timeout:.now()+3) == .success && cancelledWhileRunning,
            "cancelling an active direct transfer stops its process without launching the slow fallback")
+
+    // Without FFmpeg: real AAC segments are joined and rewrapped by AVFoundation alone.
+    let segmentDirectory = root.appendingPathComponent("RealSegments")
+    try FileManager.default.createDirectory(at: segmentDirectory, withIntermediateDirectories: true)
+    let segmenter = Process()
+    segmenter.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/ffmpeg")
+    segmenter.arguments = ["-nostdin", "-loglevel", "error", "-y", "-i", fixtureAudio.path, "-map", "0:a:0", "-c", "copy",
+                           "-f", "hls", "-hls_segment_type", "fmp4", "-hls_time", "0.05", "-hls_playlist_type", "vod",
+                           "-hls_fmp4_init_filename", "init.mp4", segmentDirectory.appendingPathComponent("playlist.m3u8").path]
+    try segmenter.run(); segmenter.waitUntilExit()
+    expect(segmenter.terminationStatus == 0, "the fixture is split into real fragmented MP4 segments")
+    let realPlaylist = URL(string: "https://playback.media-streaming.soundcloud.cloud/real/playlist.m3u8")!
+    var realMetadata = audioMetadata
+    realMetadata["media"] = ["transcodings":[transcoding("aac_160k")]]
+    let realClient = SoundCloudSearchClient(cache: nativeCache, clientID: String(repeating:"a",count:32)) { request, _ in
+        let url = request.url!
+        let data: Data
+        if url.path.hasPrefix("/tracks/") { data = try JSONSerialization.data(withJSONObject: realMetadata) }
+        else if url.host == "api-v2.soundcloud.com" { data = try JSONSerialization.data(withJSONObject: ["url": realPlaylist.absoluteString]) }
+        else { data = try Data(contentsOf: segmentDirectory.appendingPathComponent(url.lastPathComponent)) }
+        return (data, HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+    }
+    let noFFmpeg = URL(fileURLWithPath: "/nonexistent/ffmpeg")
+    let plainService = SoundCloudService(helper: root.appendingPathComponent("no-helper"), ffmpeg: noFFmpeg, cache: nativeCache, searchClient: realClient)
+    expect(plainService.ffmpeg == nil, "a missing FFmpeg is detected instead of being run")
+    let plainFile = try plainService.download(nativeResults[0], directory: root.appendingPathComponent("PlainHLS"), cancellation: SoundCloudCancellation(), stage: { _ in })
+    expect(plainFile.pathExtension == "m4a" && (try! ImportServices().playable(plainFile)),
+           "a SoundCloud AAC track becomes a playable M4A without FFmpeg")
+    let unsupportedService = SoundCloudService(helper: root.appendingPathComponent("no-helper"), ffmpeg: noFFmpeg, cache: nativeCache, searchClient: audioClient)
+    do { _ = try unsupportedService.download(nativeResults[0], directory: root.appendingPathComponent("NeedsFFmpeg"), cancellation: SoundCloudCancellation(), stage: { _ in }); fatalError("Unsupported stream accepted") }
+    catch { expect(error.localizedDescription.contains("FFmpeg"), "a stream AVFoundation cannot rewrap asks for FFmpeg by name") }
 }
 
 func waitUI(_ predicate: () -> Bool) {
@@ -1120,6 +1151,13 @@ if CommandLine.arguments.count > 1 {
     expect(m4aFile.pathExtension == "m4a" && (try! ImportServices().playable(m4aFile)), "M4A mode keeps YouTube's AAC audio in a playable M4A file")
     let m4aLog = try String(contentsOf:argsLog,encoding:.utf8).split(separator:"\n")
     expect(m4aLog.contains("bestaudio[ext=m4a]/bestaudio/best"), "M4A mode asks the extractor for the AAC stream first")
+    let missingFFmpeg = URL(fileURLWithPath: "/nonexistent/ffmpeg")
+    let plainYT = YouTubeService(helper:helperYT,ffmpeg:missingFFmpeg,runtime:URL(fileURLWithPath:"/usr/bin/true"),cache:root.appendingPathComponent("YTPlain"),fallback:nil,format:{ .m4a })
+    let plainYTFile = try plainYT.download(ytTrack,directory:root.appendingPathComponent("YTPlainDownload"),cancellation:SoundCloudCancellation(),stage:{ _ in })
+    expect(plainYTFile.pathExtension == "m4a" && (try! ImportServices().playable(plainYTFile)), "YouTube AAC becomes a playable M4A without FFmpeg")
+    let mp3WithoutFFmpeg = YouTubeService(helper:helperYT,ffmpeg:missingFFmpeg,runtime:URL(fileURLWithPath:"/usr/bin/true"),cache:root.appendingPathComponent("YTNoMP3"),fallback:nil,format:{ .mp3 })
+    do { _ = try mp3WithoutFFmpeg.download(ytTrack,directory:root.appendingPathComponent("YTNoMP3Download"),cancellation:SoundCloudCancellation(),stage:{ _ in }); fatalError("MP3 without encoder") }
+    catch { expect(error.localizedDescription.contains("FFmpeg") && error.localizedDescription.contains("M4A"), "MP3 mode without FFmpeg points to M4A or installing FFmpeg") }
     // With a direct stream in the extractor's JSON, the audio comes straight from Google's servers.
     GoogleVideoFixture.payload = try Data(contentsOf: fixtureYT)
     let directLog = root.appendingPathComponent("yt-direct-arguments")

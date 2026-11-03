@@ -36,6 +36,14 @@ struct ImportEntry: Codable, Identifiable, Equatable {
     }
 }
 
+/// Tags written into prepared audio files.
+struct AudioTags {
+    let title: String
+    let artist: String
+    let album: String
+    let comment: String
+}
+
 enum DropError: LocalizedError {
     case message(String)
     var errorDescription: String? {
@@ -88,6 +96,22 @@ enum FileTools {
         }
         try fm.moveItem(at: temporary, to: destination)
         return destination
+    }
+
+    /// FFmpeg is optional: AAC audio is rewrapped by AVFoundation, FFmpeg covers MP3 and rarer formats.
+    /// An explicit path is used only when it is executable.
+    static func ffmpeg(_ explicit: URL? = nil) -> URL? {
+        let candidates = explicit.map { [$0] }
+            ?? ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"].map { URL(fileURLWithPath: $0) }
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0.path) }
+    }
+
+    /// True when the file starts like an ISO media file (MP4, M4A or joined fMP4 segments).
+    static func isMP4(_ url: URL) -> Bool {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? handle.close() }
+        guard let head = try? handle.read(upToCount: 12), head.count == 12 else { return false }
+        return head[4..<8].elementsEqual("ftyp".utf8) || head[4..<8].elementsEqual("styp".utf8)
     }
 
     /// yt-dlp ships unpacked, so it starts without extracting itself to a temporary folder on every run.

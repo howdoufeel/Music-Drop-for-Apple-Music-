@@ -222,7 +222,8 @@ struct DropPanel: View {
                 .fixedSize(horizontal: false, vertical: true)
             Picker("Формат YouTube", selection: $youtubeFormat) {
                 Text("M4A · быстро, без перекодирования").tag(YouTubeAudioFormat.m4a)
-                Text("MP3 · для старых плееров").tag(YouTubeAudioFormat.mp3)
+                Text(FileTools.ffmpeg() == nil ? "MP3 · нужен FFmpeg (brew install ffmpeg)" : "MP3 · для старых плееров")
+                    .tag(YouTubeAudioFormat.mp3)
             }
             .pickerStyle(.menu).controlSize(.small).font(.system(size: 12))
             Toggle("Резервный сервис, если YouTube медлит дольше 5 с", isOn: $raceFallback)

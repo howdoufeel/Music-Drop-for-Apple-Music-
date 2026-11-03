@@ -92,8 +92,7 @@ final class SoundCloudService: SoundCloudProviding {
     init(helper: URL? = nil, ffmpeg: URL? = nil, cache: URL? = nil,
          searchClient: SoundCloudSearchClient? = nil, now: @escaping () -> Date = Date.init) {
         self.helper = helper ?? FileTools.extractor(in: Bundle.main.resourceURL ?? Bundle.main.bundleURL)
-        self.ffmpeg = ffmpeg ?? ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]
-            .map { URL(fileURLWithPath: $0) }.first { FileManager.default.isExecutableFile(atPath: $0.path) }
+        self.ffmpeg = FileTools.ffmpeg(ffmpeg)
         self.cache = cache ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Music Drop/Cache/SoundCloud", isDirectory: true)
         self.searchClient = searchClient ?? SoundCloudSearchClient(cache: self.cache)
@@ -204,9 +203,6 @@ final class SoundCloudService: SoundCloudProviding {
 
     func download(_ track: SoundCloudTrack, directory: URL, cancellation: SoundCloudCancellation,
                   stage: @escaping (String) -> Void, progress: @escaping (Double) -> Void) throws -> URL {
-        guard let ffmpeg else {
-            throw SoundCloudError.message("Не найден FFmpeg для подготовки аудио. На этом Mac нужен FFmpeg в /opt/homebrew/bin или /usr/local/bin.")
-        }
         let target = try Self.searchTarget(track.url.absoluteString)
         guard !target.hasPrefix("scsearch") else { throw SoundCloudError.message("Выбери конкретный трек из результатов.") }
         let working = directory.appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -223,12 +219,14 @@ final class SoundCloudService: SoundCloudProviding {
                     success = true
                     return prepared
                 }
-                _ = try run(ffmpeg, arguments: Self.nativeDownloadArguments(stream: stream, track: track, output: prepared),
-                            cancellation: cancellation, timeout: 900)
-                try validatePrepared(prepared)
-                if cancellation.isCancelled { throw SoundCloudError.cancelled }
-                success = true
-                return prepared
+                if let ffmpeg {
+                    _ = try run(ffmpeg, arguments: Self.nativeDownloadArguments(stream: stream, track: track, output: prepared),
+                                cancellation: cancellation, timeout: 900)
+                    try validatePrepared(prepared)
+                    if cancellation.isCancelled { throw SoundCloudError.cancelled }
+                    success = true
+                    return prepared
+                }
             }
         } catch SoundCloudError.rateLimited {
             throw SoundCloudError.rateLimited
@@ -238,6 +236,9 @@ final class SoundCloudService: SoundCloudProviding {
             try? FileManager.default.removeItem(at: working.appendingPathComponent("Prepared"))
         }
         if cancellation.isCancelled { throw SoundCloudError.cancelled }
+        guard let ffmpeg else {
+            throw SoundCloudError.message("Этот трек SoundCloud отдаёт в формате, для которого нужен FFmpeg. Установи его командой brew install ffmpeg.")
+        }
         guard FileManager.default.isExecutableFile(atPath: helper.path) else {
             throw SoundCloudError.message("Компонент загрузки SoundCloud не найден. Переустанови Music Drop из нового DMG.")
         }
@@ -272,11 +273,16 @@ final class SoundCloudService: SoundCloudProviding {
     }
 
     /// Joins the segments locally, then only rewraps them, so no audio is re-encoded.
+    /// AAC in MP4 segments needs only AVFoundation; other layouts use FFmpeg when it is installed.
     /// Returns false when FFmpeg should stream the playlist itself instead.
     private func nativeHLS(_ stream: SoundCloudAudioSource, track: SoundCloudTrack, working: URL, prepared: URL,
-                           ffmpeg: URL, cancellation: SoundCloudCancellation, progress: @escaping (Double) -> Void) throws -> Bool {
+                           ffmpeg: URL?, cancellation: SoundCloudCancellation, progress: @escaping (Double) -> Void) throws -> Bool {
         let joined = working.appendingPathComponent("stream.hls")
-        defer { try? FileManager.default.removeItem(at: joined) }
+        let media = working.appendingPathComponent("stream.mp4")
+        defer {
+            try? FileManager.default.removeItem(at: joined)
+            try? FileManager.default.removeItem(at: media)
+        }
         var reported = 0
         let lock = NSLock()
         do {
@@ -288,7 +294,21 @@ final class SoundCloudService: SoundCloudProviding {
                 progress(Double(done) / Double(max(1, total)))
             }
             if cancellation.isCancelled { throw SoundCloudError.cancelled }
-            _ = try run(ffmpeg, arguments: Self.localPrepareArguments(input: joined, track: track, output: prepared),
+            var input = joined
+            if prepared.pathExtension == "m4a", FileTools.isMP4(joined) {
+                try FileManager.default.moveItem(at: joined, to: media)
+                input = media
+                do {
+                    try AudioRemux.m4a(from: media, to: prepared, tags: AudioTags(title: track.title, artist: track.artist, album: "SoundCloud",
+                                                                                   comment: track.url.absoluteString), cancellation: cancellation)
+                    try validatePrepared(prepared)
+                    return true
+                } catch {
+                    if cancellation.isCancelled { throw SoundCloudError.cancelled }
+                }
+            }
+            guard let ffmpeg else { return false }
+            _ = try run(ffmpeg, arguments: Self.localPrepareArguments(input: input, track: track, output: prepared),
                         cancellation: cancellation, timeout: 300)
             try validatePrepared(prepared)
             if cancellation.isCancelled { throw SoundCloudError.cancelled }

@@ -88,8 +88,7 @@ final class YouTubeService: YouTubeProviding {
         self.raceDelay = raceDelay
         let resources = Bundle.main.resourceURL ?? Bundle.main.bundleURL
         self.helper = helper ?? FileTools.extractor(in: resources)
-        self.ffmpeg = ffmpeg ?? ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"]
-            .map { URL(fileURLWithPath: $0) }.first { FileManager.default.isExecutableFile(atPath: $0.path) }
+        self.ffmpeg = FileTools.ffmpeg(ffmpeg)
         #if arch(arm64)
         let runtimeName = "deno-arm64"
         #else
@@ -183,11 +182,13 @@ final class YouTubeService: YouTubeProviding {
          "--socket-timeout", "10", "--retries", "1", "--fragment-retries", "2", "--extractor-retries", "1",
          "--cache-dir", cache.path, "--js-runtimes", "deno:" + runtime.path]
     }
+    static let ffmpegNeeded = "Для MP3 нужен FFmpeg: установи его командой brew install ffmpeg или выбери M4A в настройках Music Drop."
+
     private func validateTools(needsEncoder: Bool) throws {
         guard FileManager.default.isExecutableFile(atPath: helper.path), FileManager.default.isExecutableFile(atPath: runtime.path) else {
             throw DropError.message("Компонент YouTube не найден. Переустанови Music Drop из нового DMG.")
         }
-        if needsEncoder && ffmpeg == nil { throw DropError.message("Для подготовки аудио нужен FFmpeg в /opt/homebrew/bin или /usr/local/bin.") }
+        if needsEncoder && ffmpeg == nil { throw DropError.message(Self.ffmpegNeeded) }
     }
     func preview(_ input: String, cancellation: SoundCloudCancellation) -> YouTubeTrack? {
         guard let id = try? Self.videoID(input) else { return nil }
@@ -331,9 +332,10 @@ final class YouTubeService: YouTubeProviding {
     func download(_ track: YouTubeTrack, directory: URL, cancellation: SoundCloudCancellation,
                   stage: @escaping (String) -> Void, progress: @escaping (Double) -> Void) throws -> URL {
         _ = try Self.videoID(track.url.absoluteString)
-        guard let ffmpeg else { throw DropError.message("Для подготовки аудио нужен FFmpeg в /opt/homebrew/bin или /usr/local/bin.") }
         if cancellation.isCancelled { throw SoundCloudError.cancelled }
         let format = self.format()
+        // M4A from AAC needs only AVFoundation; MP3 always needs the encoder.
+        if format == .mp3, ffmpeg == nil { throw DropError.message(Self.ffmpegNeeded) }
         let working = directory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: working, withIntermediateDirectories: true)
         var success = false
@@ -345,7 +347,7 @@ final class YouTubeService: YouTubeProviding {
                                            preferAAC: format == .m4a)
         } else {
             do {
-                try validateTools(needsEncoder: true)
+                try validateTools(needsEncoder: false)
                 source = try directSource(track.id, format: format, working: working, cancellation: cancellation,
                                           stage: stage, progress: progress)
             } catch {
@@ -453,7 +455,7 @@ final class YouTubeService: YouTubeProviding {
         return downloaded
     }
 
-    private func prepare(_ source: URL, track: YouTubeTrack, format: YouTubeAudioFormat, working: URL, ffmpeg: URL,
+    private func prepare(_ source: URL, track: YouTubeTrack, format: YouTubeAudioFormat, working: URL, ffmpeg: URL?,
                          cancellation: SoundCloudCancellation, stage: @escaping (String) -> Void) throws -> URL {
         let preparedDirectory = working.appendingPathComponent("Prepared", isDirectory: true)
         try FileManager.default.createDirectory(at: preparedDirectory, withIntermediateDirectories: true)
@@ -462,6 +464,7 @@ final class YouTubeService: YouTubeProviding {
         for c in cleaned { if (name + String(c)).utf8.count > 180 { break }; name.append(c) }
         let base = name.isEmpty ? "YouTube" : name
         if format == .mp3 {
+            guard let ffmpeg else { throw DropError.message(Self.ffmpegNeeded) }
             stage("Сохраняем MP3…")
             let prepared = preparedDirectory.appendingPathComponent(base + ".mp3")
             _ = try run(ffmpeg, arguments: Self.encodeArguments(source: source, output: prepared, track: track), cancellation: cancellation, timeout: 300)
@@ -471,12 +474,24 @@ final class YouTubeService: YouTubeProviding {
         if ["m4a", "mp4", "aac"].contains(source.pathExtension.lowercased()) {
             stage("Сохраняем M4A без перекодирования…")
             do {
-                _ = try run(ffmpeg, arguments: Self.m4aArguments(source: source, output: prepared, track: track, codec: ["-c:a", "copy"]),
-                            cancellation: cancellation, timeout: 300)
+                try AudioRemux.m4a(from: source, to: prepared, tags: AudioTags(title: track.title, artist: track.artist, album: "YouTube",
+                                                                               comment: track.url.absoluteString), cancellation: cancellation)
                 return prepared
             } catch {
                 if cancellation.isCancelled { throw SoundCloudError.cancelled }
             }
+            if let ffmpeg {
+                do {
+                    _ = try run(ffmpeg, arguments: Self.m4aArguments(source: source, output: prepared, track: track, codec: ["-c:a", "copy"]),
+                                cancellation: cancellation, timeout: 300)
+                    return prepared
+                } catch {
+                    if cancellation.isCancelled { throw SoundCloudError.cancelled }
+                }
+            }
+        }
+        guard let ffmpeg else {
+            throw DropError.message("Для этого видео YouTube отдаёт только Opus; чтобы сохранить его в M4A, нужен FFmpeg (brew install ffmpeg).")
         }
         stage("Сохраняем M4A…")
         do {
