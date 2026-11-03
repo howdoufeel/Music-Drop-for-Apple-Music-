@@ -22,6 +22,7 @@ import Observation
     /// Put the set's tracks into a playlist named after it.
     var collectionIntoPlaylist = true
     @ObservationIgnored private var playlistTargets: [String: String] = [:]
+    @ObservationIgnored private var autoAddInput: String?
     private let service: SoundCloudProviding
     private let searchQueue = DispatchQueue(label: "tech.musicdrop.soundcloud.search", qos: .userInitiated, attributes: .concurrent)
     private let downloadQueue: OperationQueue = {
@@ -50,8 +51,10 @@ import Observation
             .appendingPathComponent("Music Drop/Downloads/SoundCloud", isDirectory: true)
     }
 
-    func search() {
+    /// With `autoAdd` a track link is added as soon as it resolves, as the hotkey and URL scheme ask.
+    func search(autoAdd: Bool = false) {
         let input = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        autoAddInput = autoAdd && input.contains("://") ? input : nil
         if isSearching, activeSearchInput == input { return }
         if let link = SoundCloudService.collectionTarget(input) { openCollection(link, input: input); return }
         collection = nil
@@ -77,6 +80,10 @@ import Observation
                     self.results = results
                     self.isSearching = false
                     self.stopPreviewIfUnlisted()
+                    if self.autoAddInput == input, let first = results.first {
+                        self.autoAddInput = nil
+                        self.add(first)
+                    }
                 }
             } catch {
                 DispatchQueue.main.async {

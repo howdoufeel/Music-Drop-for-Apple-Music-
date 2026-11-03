@@ -243,6 +243,23 @@ do {
     settle(slowStore)
 }
 
+// Import results reach the notifier.
+do {
+    var reported: [String] = []
+    var eventServices = services
+    let eventStore = ImportStore(directory: root.appendingPathComponent("EventState"), services: eventServices, startTimer: false)
+    eventStore.onImported = { reported.append("ok:" + $0.title) }
+    eventStore.onFailed = { reported.append("failed:" + $0.title) }
+    let eventFile = root.appendingPathComponent("event-ok.mp3"); try Data("event-ok".utf8).write(to: eventFile)
+    eventStore.accept([eventFile]); settle(eventStore)
+    eventServices.add = { _ in throw AutomationError(code: -1743, detail: "denied") }
+    let failingEventStore = ImportStore(directory: root.appendingPathComponent("EventFailState"), services: eventServices, startTimer: false)
+    failingEventStore.onFailed = { reported.append("failed:" + $0.title) }
+    let failingFile = root.appendingPathComponent("event-fail.mp3"); try Data("event-fail".utf8).write(to: failingFile)
+    failingEventStore.accept([failingFile]); settle(failingEventStore)
+    expect(reported == ["ok:Трек один", "failed:event-fail"], "finished and failed imports are reported once each")
+}
+
 // A chosen playlist receives every new track; existing tracks join it without another import.
 do {
     let playlistDefaults = UserDefaults(suiteName: "musicdrop-tests-" + UUID().uuidString)!
@@ -1233,6 +1250,26 @@ previewModel.query = "other"; previewModel.search()
 waitUI { !previewModel.isSearching }
 expect(previewModel.previewID == nil && played.last == .some(nil), "listening stops when its track leaves the results")
 
+// The hotkey and the URL scheme add a link as soon as it resolves; a word search never adds by itself.
+let autoModel = SoundCloudStore(service: PreviewFixture(), directory: root.appendingPathComponent("AutoAdd"))
+var autoAdded: [String] = []
+autoModel.onReady = { _, track in autoAdded.append(track.id) }
+autoModel.query = "plain words"; autoModel.search(autoAdd: true)
+waitUI { !autoModel.isSearching }
+RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+expect(autoAdded.isEmpty && !autoModel.isDownloading, "a word search is never added automatically")
+autoModel.query = "https://soundcloud.com/artist/song"; autoModel.search(autoAdd: true)
+waitUI { !autoModel.isSearching }
+waitUI { !autoModel.isDownloading }
+expect(autoAdded == ["https://soundcloud.com/artist/song"], "a track link is downloaded and handed to the library at once")
+let autoYouTube = YouTubeStore(service: YouTubeFixture(), directory: root.appendingPathComponent("AutoYouTube"), prefetch: false)
+var autoYouTubeAdded = 0
+autoYouTube.onReady = { _, _ in autoYouTubeAdded += 1 }
+autoYouTube.query = "https://youtu.be/BaW_jenozKc"; autoYouTube.search(autoAdd: true)
+waitUI { !autoYouTube.isSearching }
+waitUI { !autoYouTube.isDownloading }
+expect(autoYouTubeAdded == 1, "a YouTube link is added as soon as it is checked")
+
 let parallelProvider = ParallelDownloadFixture()
 let parallelStore = SoundCloudStore(service:parallelProvider,directory:root.appendingPathComponent("ParallelAudio"))
 let parallelTracks = (0..<3).map { SoundCloudTrack(id:"parallel-\($0)",title:"Parallel \($0)",artist:"Artist",url:URL(string:"https://soundcloud.com/artist/track-\($0)")!) }
@@ -1822,6 +1859,15 @@ expect(LinkRoute.detect("https://example.com/song") == nil && LinkRoute.forInput
 expect(LinkRoute.detect("https://www.youtube.com/playlist?list=PL1234") == .youTube("https://www.youtube.com/playlist?list=PL1234")
        && LinkRoute.detect("https://soundcloud.com/artist/sets/album") == .soundCloud("https://soundcloud.com/artist/sets/album"),
        "YouTube playlists and SoundCloud sets open in their tabs")
+
+let schemeAdd = LinkRoute.scheme(URL(string: "musicdrop://add?url=" + "https://youtu.be/\(ytID)".addingPercentEncoding(withAllowedCharacters: .alphanumerics)!)!)
+let schemeOpen = LinkRoute.scheme(URL(string: "musicdrop://open?url=https%3A%2F%2Fsoundcloud.com%2Fa%2Fsets%2Fb")!)
+expect(schemeAdd?.route == .youTube("https://youtu.be/\(ytID)") && schemeAdd?.add == true
+       && schemeOpen?.route == .soundCloud("https://soundcloud.com/a/sets/b") && schemeOpen?.add == false,
+       "musicdrop:// links add or open SoundCloud and YouTube links")
+expect(LinkRoute.scheme(URL(string: "musicdrop://delete?url=https%3A%2F%2Fyoutu.be%2F\(ytID)")!) == nil
+       && LinkRoute.scheme(URL(string: "musicdrop://add?url=https%3A%2F%2Fexample.com")!) == nil
+       && LinkRoute.scheme(URL(string: "https://add?url=x")!) == nil, "unknown actions, foreign links and other schemes are ignored")
 
 let progressLog = root.appendingPathComponent("progress.log")
 try Data("[download] noise\nMDPROGRESS 50 200\nMDPROGRESS 10 NA\nMDPROGRESS 100 2".utf8).write(to: progressLog)

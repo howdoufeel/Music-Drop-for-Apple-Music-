@@ -58,6 +58,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
     var navigation: PanelNavigation!
     let previewPlayer = PreviewPlayer()
     private var wasDownloading = false
+    private var hotKey: HotKey?
     var previewWindow: NSWindow?
     var globalMonitor: Any?
     var localMonitor: Any?
@@ -108,6 +109,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         }
         store.onActivity = { [weak self] _ in self?.updateActivity() }
         store.downloadsActive = { [weak self] in self.map { $0.soundCloud.isDownloading || $0.youtube.isDownloading } ?? false }
+        store.onImported = { Notifier.shared.imported($0) }
+        store.onFailed = { Notifier.shared.failed($0) }
+        if !preview { configureHotKey() }
         popover.behavior = .transient
         popover.animates = !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         popover.delegate = self
@@ -116,7 +120,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
             if event.type == .keyDown, event.keyCode == 53 { self.popover.performClose(nil) }
             return event
         }
-        if !pendingURLs.isEmpty { store.accept(pendingURLs); pendingURLs.removeAll() }
+        if !pendingURLs.isEmpty {
+            let pending = pendingURLs
+            pendingURLs.removeAll()
+            application(NSApp, open: pending)
+        }
         // YouTube changes often outpace app releases; a newer yt-dlp is fetched in the background.
         if !preview { ExtractorUpdater.shared.checkIfDue() }
         showWindow()
@@ -143,6 +151,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         submenu("Music Drop", [
             item("Открыть Music Drop", #selector(showWindow), "0", target: self),
             item("Настройки…", #selector(showSettings), ",", target: self),
+            item("Добавить ссылку из буфера (⌃⌥M)", #selector(addFromClipboard), "", target: self),
             .separator(),
             item("Завершить Music Drop", #selector(NSApplication.terminate(_:)), "q", target: NSApp)
         ])
@@ -276,8 +285,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {
-        if store == nil { pendingURLs.append(contentsOf: urls) }
-        else { store.accept(urls); show() }
+        if store == nil { pendingURLs.append(contentsOf: urls); return }
+        for link in urls where link.scheme?.lowercased() == "musicdrop" { openScheme(link) }
+        let files = urls.filter(\.isFileURL)
+        if !files.isEmpty { store.accept(files); show() }
+    }
+
+    /// musicdrop://add?url=… adds in the background; musicdrop://open?url=… shows the link.
+    private func openScheme(_ url: URL) {
+        guard let request = LinkRoute.scheme(url) else { NSSound.beep(); return }
+        if !request.add || opensCollection(request.route) { reveal() }
+        navigation.open(request.route, autoAdd: request.add)
+    }
+
+    private func opensCollection(_ route: LinkRoute) -> Bool {
+        switch route {
+        case .youTube(let link): return YouTubeService.isPlaylistLink(link)
+        case .soundCloud(let link): return SoundCloudService.collectionTarget(link) != nil
+        }
+    }
+
+    func configureHotKey() {
+        hotKey = HotKey.enabled ? HotKey.clipboardShortcut { [weak self] in self?.addFromClipboard() } : nil
+    }
+
+    /// ⌃⌥M anywhere: the copied track is added without opening a window; a notification reports the result.
+    @objc func addFromClipboard() {
+        let pasteboard = NSPasteboard.general
+        let text = pasteboard.string(forType: .string)
+            ?? (pasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL])?.first?.absoluteString
+        guard let text, let route = LinkRoute.detect(text) else {
+            NSSound.beep()
+            Notifier.shared.post(title: "В буфере нет ссылки на трек", body: "Скопируй ссылку SoundCloud или YouTube и нажми ⌃⌥M ещё раз.")
+            return
+        }
+        if opensCollection(route) { reveal() }
+        navigation.open(route, autoAdd: true)
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {

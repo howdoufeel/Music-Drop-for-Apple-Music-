@@ -95,6 +95,9 @@ private final class HistoryWriter {
     /// True while SoundCloud or YouTube audio is downloading: its import comes next, so Music is
     /// kept free of status reads and cloud requests until then.
     @ObservationIgnored var downloadsActive: () -> Bool = { false }
+    /// Called on the main thread when a track reaches the library or cannot be added.
+    @ObservationIgnored var onImported: ((ImportEntry) -> Void)?
+    @ObservationIgnored var onFailed: ((ImportEntry) -> Void)?
     private let defaults: UserDefaults
     static let destinationKey = "DestinationPlaylist"
     static let playlistsKey = "KnownPlaylists"
@@ -471,6 +474,7 @@ private final class HistoryWriter {
                         $0.isFavorite = result.isFavorite; $0.favoriteError = result.favoriteError
                         $0.playlistError = playlistProblem
                     }
+                    if let imported = self.entries.first(where: { $0.id == entry.id }) { self.onImported?(imported) }
                     self.requestCloudUpdate(for: [entry.id])
                 }
             } catch {
@@ -479,6 +483,7 @@ private final class HistoryWriter {
                         $0.stage = (error as? AutomationError)?.code == -1712 ? .needsReview : .failed
                         $0.error = error.localizedDescription
                     }
+                    if let failed = self.entries.first(where: { $0.id == entry.id }) { self.onFailed?(failed) }
                     // Earlier tracks of the batch may still be waiting for their cloud request.
                     self.beginCloudUpdate()
                 }

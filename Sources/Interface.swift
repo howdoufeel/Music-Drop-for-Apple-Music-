@@ -18,16 +18,16 @@ private let accent = Color(nsColor: .systemPink)
         self.youtube = youtube
     }
 
-    func open(_ route: LinkRoute) {
+    func open(_ route: LinkRoute, autoAdd: Bool = false) {
         switch route {
         case .youTube(let link):
             tab = .youTube
             youtube.query = link
-            youtube.search()
+            youtube.search(autoAdd: autoAdd)
         case .soundCloud(let text):
             tab = .soundCloud
             soundCloud.query = text
-            soundCloud.search()
+            soundCloud.search(autoAdd: autoAdd)
         }
     }
 
@@ -128,6 +128,8 @@ struct DropPanel: View {
     @AppStorage(YouTubeFallbackRace.defaultsKey) private var raceFallback = true
     @State private var fileTargeted = false
     @State private var extractor = ExtractorUpdateModel()
+    @State private var notificationsOn = Notifier.shared.enabled
+    @State private var hotKeyOn = HotKey.enabled
     @State private var creatingPlaylist = false
     @State private var newPlaylistName = ""
 
@@ -329,6 +331,15 @@ struct DropPanel: View {
             .pickerStyle(.menu).controlSize(.small).font(.system(size: 12))
             Toggle("Резервный сервис, если YouTube медлит дольше 5 с", isOn: $raceFallback)
                 .toggleStyle(.switch).controlSize(.small).font(.system(size: 12))
+            Toggle("Уведомлять о добавленных треках, когда окно скрыто", isOn: Binding(get: { notificationsOn },
+                                                                                       set: { notificationsOn = $0; Notifier.shared.enabled = $0 }))
+                .toggleStyle(.switch).controlSize(.small).font(.system(size: 12))
+            Toggle("⌃⌥M в любом приложении добавляет ссылку из буфера", isOn: Binding(get: { hotKeyOn }, set: {
+                hotKeyOn = $0
+                HotKey.enabled = $0
+                (NSApp.delegate as? AppDelegate)?.configureHotKey()
+            }))
+            .toggleStyle(.switch).controlSize(.small).font(.system(size: 12))
             VStack(alignment: .leading, spacing: 6) {
                 HStack {
                     Text("Компонент YouTube: yt-dlp " + (extractor.version ?? "—")).font(.system(size: 12))

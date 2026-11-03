@@ -22,6 +22,7 @@ import Observation
     /// The playlist of a watch link that was opened as a single video.
     private(set) var relatedPlaylistID: String?
     @ObservationIgnored private var playlistTargets: [String: String] = [:]
+    @ObservationIgnored private var autoAddInput: String?
     private let service: YouTubeProviding
     private let searchQueue = DispatchQueue(label: "tech.musicdrop.youtube.search", qos: .userInitiated, attributes: .concurrent)
     private let downloadQueue: OperationQueue = {
@@ -57,8 +58,10 @@ import Observation
             .appendingPathComponent("Music Drop/Downloads/YouTube", isDirectory: true)
     }
 
-    func search() {
+    /// With `autoAdd` a video link is added as soon as it resolves, as the hotkey and URL scheme ask.
+    func search(autoAdd: Bool = false) {
         let input = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        autoAddInput = autoAdd ? input : nil
         if isSearching, activeSearchInput == input { return }
         if YouTubeService.isPlaylistLink(input), let id = YouTubeService.playlistID(input) { openPlaylist(id, input: input); return }
         relatedPlaylistID = YouTubeService.playlistID(input)
@@ -95,6 +98,10 @@ import Observation
                     self.results = [track] + self.results.filter { $0.id != track.id }
                     self.isSearching = false
                     self.startPrefetch(track)
+                    if self.autoAddInput == input {
+                        self.autoAddInput = nil
+                        self.add(track)
+                    }
                 }
             } catch {
                 DispatchQueue.main.async {

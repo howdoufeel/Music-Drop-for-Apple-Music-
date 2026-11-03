@@ -16,6 +16,15 @@ enum LinkRoute: Equatable {
         return nil
     }
 
+    /// `musicdrop://add?url=<link>` adds a track at once; `musicdrop://open?url=<link>` only opens it.
+    /// Bookmarklets, launchers and Shortcuts reach Music Drop this way.
+    static func scheme(_ url: URL) -> (route: LinkRoute, add: Bool)? {
+        guard url.scheme?.lowercased() == "musicdrop", let action = url.host?.lowercased(), ["add", "open"].contains(action),
+              let link = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "url" })?.value,
+              let route = detect(link) else { return nil }
+        return (route, action == "add")
+    }
+
     /// For a search field: links go to their source, plain words to SoundCloud search.
     static func forInput(_ text: String) -> LinkRoute? {
         let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
