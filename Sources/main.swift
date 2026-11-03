@@ -70,7 +70,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
     func applicationDidFinishLaunching(_ notification: Notification) {
         configureMainMenu()
         let preview = CommandLine.arguments.contains("--preview")
-        store = ImportStore(preview: preview)
+        store = ImportStore(preview: preview, services: .app)
         soundCloud = SoundCloudStore(preview: preview)
         youtube = YouTubeStore(preview: preview)
         navigation = PanelNavigation(soundCloud: soundCloud, youtube: youtube)

@@ -35,6 +35,8 @@ struct ImportEntry: Codable, Identifiable, Equatable {
     /// Start, end and album position set in Music after the import; the file itself is not cut.
     var adjustments: TrackAdjustments?
     var adjustmentError: String?
+    /// True once lyrics were written into Music, false when none were found.
+    var hasLyrics: Bool?
     var error: String?
 
     var cloudRetryMessage: String? {

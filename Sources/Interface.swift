@@ -143,6 +143,7 @@ struct DropPanel: View {
     @State private var notificationsOn = Notifier.shared.enabled
     @State private var hotKeyOn = HotKey.enabled
     @State private var watchedFolder = FolderWatcher.savedFolder
+    @State private var lyricsOn = Lyrics.enabled
     @State private var historyQuery = ""
     @State private var historyFilter = HistoryFilter.all
     @State private var historyLimit = 100
@@ -315,7 +316,7 @@ struct DropPanel: View {
                 }
             }
             if showingStats {
-                StatsView(entries: store.entries, tint: accent)
+                StatsView(store: store, tint: accent)
             }
             if store.entries.isEmpty {
                 VStack(spacing: 7) {
@@ -388,6 +389,12 @@ struct DropPanel: View {
                 (NSApp.delegate as? AppDelegate)?.configureHotKey()
             }))
             .toggleStyle(.switch).controlSize(.small).font(.system(size: 12))
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle("Добавлять тексты песен", isOn: Binding(get: { lyricsOn }, set: { lyricsOn = $0; Lyrics.enabled = $0 }))
+                    .toggleStyle(.switch).controlSize(.small).font(.system(size: 12))
+                Text("Тексты ищутся в открытой базе LRCLIB: ей передаются название, исполнитель и длина трека.")
+                    .font(.system(size: 10)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
             watchedFolderSettings
             if !subscriptions.subscriptions.isEmpty { subscriptionSettings }
             VStack(alignment: .leading, spacing: 6) {
@@ -664,6 +671,13 @@ private struct HistoryRow: View {
                             Image(systemName: "star.fill").font(.system(size: 9)).foregroundStyle(accent)
                                 .accessibilityLabel("В избранном")
                         }
+                        if entry.hasLyrics == true {
+                            Image(systemName: "quote.bubble").font(.system(size: 9)).foregroundStyle(.secondary)
+                                .help("Текст песни добавлен").accessibilityLabel("С текстом песни")
+                        }
+                        if store.updatingLyrics.contains(entry.id) {
+                            ProgressView().controlSize(.mini).scaleEffect(0.7).help("Ищем текст песни")
+                        }
                     }
                     Text(subtitle).font(.system(size: 10))
                         .foregroundStyle(warning ? Color.orange : Color.secondary)
@@ -751,6 +765,8 @@ private struct HistoryRow: View {
                     .disabled(store.updatingFavorites.contains(entry.id))
                 Button("Обрезать начало и конец…") { beginTrim() }
                     .disabled(store.updatingAdjustments.contains(entry.id))
+                Button(entry.hasLyrics == true ? "Обновить текст песни" : "Найти текст песни") { store.findLyrics(entry) }
+                    .disabled(store.updatingLyrics.contains(entry.id) || entry.artist?.nonEmpty == nil)
             }
             if entry.stage == .failed { Button("Повторить") { store.retry(entry) } }
             if let path = entry.managedPath {

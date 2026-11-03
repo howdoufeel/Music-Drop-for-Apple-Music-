@@ -171,6 +171,26 @@ enum MusicBridge {
         }
     }
 
+    static func lyricsSource(id: String, text: String) -> String {
+        """
+        with timeout of 30 seconds
+            tell application id "com.apple.Music"
+                set foundTracks to (every track of library playlist 1 whose persistent ID is \(FileTools.appleScriptLiteral(id)))
+                if (count of foundTracks) is 0 then error "Трек не найден в медиатеке" number -1728
+                set lyrics of (item 1 of foundTracks) to \(FileTools.appleScriptLiteral(text))
+                return true
+            end tell
+        end timeout
+        """
+    }
+
+    static func setLyrics(id: String, text: String) throws {
+        try ensureRunning()
+        guard try execute(lyricsSource(id: id, text: text)).booleanValue else {
+            throw DropError.message("«Музыка» не подтвердила запись текста.")
+        }
+    }
+
     static let playlistNamesSource = """
     with timeout of 10 seconds
         tell application id "com.apple.Music"

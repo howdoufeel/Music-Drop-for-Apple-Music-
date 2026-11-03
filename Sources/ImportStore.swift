@@ -29,6 +29,27 @@ struct ImportServices {
     var playlistNames: () throws -> [String] = MusicBridge.playlistNames
     var deleteTrack: (String) throws -> Void = MusicBridge.deleteTrack
     var adjust: (String, TrackAdjustments) throws -> Void = MusicBridge.adjust
+    /// Lyrics are looked up only where the app turns it on, so tests never reach the network.
+    var lyricsEnabled: () -> Bool = { false }
+    var lyrics: (_ title: String, _ artist: String, _ duration: Double?) throws -> String? = {
+        try Lyrics.find(title: $0, artist: $1, album: nil, duration: $2)
+    }
+    var setLyrics: (String, String) throws -> Void = MusicBridge.setLyrics
+
+    /// What the app itself uses: everything above, with lyrics following the setting.
+    static var app: ImportServices {
+        var services = ImportServices()
+        services.lyricsEnabled = { Lyrics.enabled }
+        return services
+    }
+}
+
+/// Progress of putting many library tracks into one playlist.
+struct PlaylistBuild: Equatable {
+    let name: String
+    let total: Int
+    var done = 0
+    var failed = 0
 }
 
 /// Coalesces history writes off the main thread; the newest snapshot always wins.
@@ -74,6 +95,9 @@ private final class HistoryWriter {
     private(set) var availablePlaylists: [String] = []
     var updatingPlaylists: Set<UUID> = []
     var updatingAdjustments: Set<UUID> = []
+    var updatingLyrics: Set<UUID> = []
+    private(set) var playlistBuild: PlaylistBuild?
+    private let lyricsQueue = DispatchQueue(label: "tech.musicdrop.lyrics", qos: .utility)
     // Derived from entries once per change, so views and timers never rescan the history.
     private(set) var activeImportCount = 0
     private(set) var successfulCount = 0
@@ -106,7 +130,8 @@ private final class HistoryWriter {
     static let playlistsKey = "KnownPlaylists"
 
     var activeCount: Int {
-        activeImportCount + updatingFavorites.count + updatingPlaylists.count + updatingAdjustments.count + (cloudUpdateInProgress ? 1 : 0)
+        activeImportCount + updatingFavorites.count + updatingPlaylists.count + updatingAdjustments.count + updatingLyrics.count
+            + (playlistBuild == nil ? 0 : 1) + (cloudUpdateInProgress ? 1 : 0)
     }
     /// Newest entry for a source track, ignoring ones removed from Music.
     func entry(soundCloudID id: String) -> ImportEntry? { soundCloudEntries[id] }
@@ -319,6 +344,63 @@ private final class HistoryWriter {
                     case .failure(let error): $0.adjustmentError = error.localizedDescription
                     }
                 }
+            }
+        }
+    }
+
+    /// Looks the lyrics up on LRCLIB and writes them into the track in Music. Automatic lookups stay quiet.
+    func findLyrics(_ entry: ImportEntry, automatic: Bool = false) {
+        guard !preview, entry.stage == .imported, let trackID = entry.trackID, !updatingLyrics.contains(entry.id) else { return }
+        guard let artist = entry.artist?.nonEmpty else {
+            if !automatic { notice = "У «\(entry.title)» не указан исполнитель, текст не найти." }
+            return
+        }
+        updatingLyrics.insert(entry.id)
+        lyricsQueue.async { [weak self] in
+            guard let self else { return }
+            let found = Result { try self.services.lyrics(entry.title, artist, entry.duration) }
+            guard case .success(let text?) = found else {
+                DispatchQueue.main.async {
+                    self.updatingLyrics.remove(entry.id)
+                    if case .success = found { self.update(entry.id) { $0.hasLyrics = false } }
+                    guard !automatic else { return }
+                    if case .failure = found { self.notice = "LRCLIB не ответил. Попробуй позже." }
+                    else { self.notice = "Текст для «\(entry.title)» не найден." }
+                }
+                return
+            }
+            // Music is changed on the import queue, between imports.
+            self.queue.async {
+                let written = Result { try self.services.setLyrics(trackID, text) }
+                DispatchQueue.main.async {
+                    self.updatingLyrics.remove(entry.id)
+                    switch written {
+                    case .success: self.update(entry.id) { $0.hasLyrics = true }
+                    case .failure(let error): if !automatic { self.notice = "Не удалось записать текст: " + error.localizedDescription }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Puts tracks into one playlist in the order they were added; entry records are left alone.
+    func buildPlaylist(_ name: String, from candidates: [ImportEntry]) {
+        let targets = candidates.filter { $0.stage == .imported && $0.cloudStatus != "missing" }
+            .sorted { $0.date < $1.date }.compactMap(\.trackID)
+        guard !preview, playlistBuild == nil, !targets.isEmpty, let name = name.nonEmpty else { return }
+        playlistBuild = PlaylistBuild(name: name, total: targets.count)
+        queue.async { [weak self] in
+            guard let self else { return }
+            var failed = 0
+            for (index, id) in targets.enumerated() {
+                do { try self.services.addToPlaylist(id, name) } catch { failed += 1 }
+                let done = index + 1, failures = failed
+                DispatchQueue.main.async { self.playlistBuild?.done = done; self.playlistBuild?.failed = failures }
+            }
+            DispatchQueue.main.async {
+                self.playlistBuild = nil
+                self.notice = failed == 0 ? "Плейлист «\(name)» собран: \(LibraryStats.plural(targets.count, "трек", "трека", "треков"))."
+                    : "Плейлист «\(name)»: добавлено \(targets.count - failed), не удалось \(failed)."
             }
         }
     }
@@ -550,7 +632,10 @@ private final class HistoryWriter {
                         $0.artist = result.artist ?? $0.artist
                         $0.duration = result.duration ?? $0.duration
                     }
-                    if let imported = self.entries.first(where: { $0.id == entry.id }) { self.onImported?(imported) }
+                    if let imported = self.entries.first(where: { $0.id == entry.id }) {
+                        self.onImported?(imported)
+                        if self.services.lyricsEnabled() { self.findLyrics(imported, automatic: true) }
+                    }
                     self.requestCloudUpdate(for: [entry.id])
                 }
             } catch {

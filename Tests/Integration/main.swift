@@ -359,6 +359,79 @@ expect(finishOpen != nil && startSet != nil && finishOpen!.lowerBound < startSet
        "the Music script opens the range before setting a start and quotes the album artist")
 expect(MusicBridge.adjustSource(id: "ABC", adjustments: TrackAdjustments()).contains("set start of selectedTrack to 0"), "no start means the beginning")
 
+// Lyrics come from LRCLIB and go into Music; a year's tracks can fill one playlist.
+let lyricsResults: [[String: Any]] = [
+    ["duration": 250, "plainLyrics": "Далёкая запись", "instrumental": false],
+    ["duration": 181, "plainLyrics": nil as Any? ?? NSNull(), "syncedLyrics": "[00:12.30]Первая строка\r\n[01:02.00][01:30.50] Припев", "instrumental": false],
+    ["duration": 180, "instrumental": true, "plainLyrics": "—"]
+]
+let lyricsData = try JSONSerialization.data(withJSONObject: lyricsResults)
+expect(Lyrics.best(lyricsData, duration: 180) == "Первая строка\nПрипев", "the closest recording wins, synced times are dropped and instrumentals skipped")
+expect(Lyrics.best(lyricsData, duration: 400) == nil && Lyrics.best(lyricsData, duration: nil) == "Далёкая запись" && Lyrics.best(Data("{}".utf8), duration: nil) == nil,
+       "a match far off in length is a different recording; without a length the first lyrics count")
+expect(Lyrics.clean("a\u{0007}b\r\nc") == "ab\nc" && Lyrics.clean("   ") == nil && Lyrics.clean(String(repeating: "x", count: Lyrics.maximumLength + 1)) == nil,
+       "lyrics are cleaned and bounded")
+var lyricsURLs: [URL] = []
+let foundLyrics = try Lyrics.find(title: "Песня", artist: "Певица", album: "Альбом", duration: 180) { url in
+    lyricsURLs.append(url)
+    return url.query?.contains("album_name") == true ? Data("[]".utf8) : lyricsData
+}
+let firstLyricsQuery = URLComponents(url: lyricsURLs[0], resolvingAgainstBaseURL: false)?.queryItems ?? []
+expect(foundLyrics == "Первая строка\nПрипев" && lyricsURLs.count == 2 && lyricsURLs.allSatisfy { $0.host == "lrclib.net" && $0.path == "/api/search" }
+       && firstLyricsQuery.contains(URLQueryItem(name: "album_name", value: "Альбом")) && !(lyricsURLs[1].query ?? "").contains("album_name"),
+       "the album narrows the search first and is dropped when nothing matches")
+let blankLyrics = try Lyrics.find(title: " ", artist: "Певица", album: nil, duration: nil) { _ in fatalError("no request") }
+expect(blankLyrics == nil, "no title means no request")
+expect(MusicBridge.lyricsSource(id: "ABC", text: "Строка \"1\"\nСтрока 2").contains("set lyrics of (item 1 of foundTracks) to \"Строка \\\"1\\\"\\nСтрока 2\""),
+       "lyrics reach Music as one quoted string")
+do {
+    var written: [(String, String)] = []
+    var lyricsAnswer: Result<String?, Error> = .success("Куплет")
+    var lyricsServices = services
+    lyricsServices.musicIsRunning = { true }
+    lyricsServices.lyricsEnabled = { true }
+    lyricsServices.lyrics = { title, artist, _ in
+        expect(title == "Трек один" && artist == "Певица", "lyrics are looked up by Music's title and the artist")
+        return try lyricsAnswer.get()
+    }
+    lyricsServices.setLyrics = { id, text in written.append((id, text)) }
+    var playlistAdds: [(String, String)] = []
+    lyricsServices.addToPlaylist = { id, name in
+        playlistAdds.append((id, name))
+        if id == "FAIL" { throw DropError.message("нет") }
+    }
+    let lyricsStore = ImportStore(directory: root.appendingPathComponent("LyricsState"), services: lyricsServices, startTimer: false,
+                                  defaults: UserDefaults(suiteName: "musicdrop-lyrics-" + UUID().uuidString)!)
+    let lyricsFile = root.appendingPathComponent("lyrics.mp3")
+    try Data("lyrics".utf8).write(to: lyricsFile)
+    lyricsStore.acceptSoundCloud(lyricsFile, track: SoundCloudTrack(id: "lyr", title: "Песня", artist: "Певица",
+                                                                   url: URL(string: "https://soundcloud.com/a/lyr")!, duration: 180))
+    settle(lyricsStore)
+    expect(written.count == 1 && written[0] == ("00000000000000A1", "Куплет") && lyricsStore.entries[0].hasLyrics == true && lyricsStore.notice == nil,
+           "lyrics are written into the new track right after the import")
+    lyricsAnswer = .success(nil)
+    lyricsStore.findLyrics(lyricsStore.entries[0])
+    settle(lyricsStore)
+    expect(lyricsStore.entries[0].hasLyrics == false && lyricsStore.notice?.contains("не найден") == true && written.count == 1,
+           "a manual search that finds nothing says so")
+    lyricsAnswer = .failure(DropError.message("offline"))
+    lyricsStore.findLyrics(lyricsStore.entries[0])
+    settle(lyricsStore)
+    expect(lyricsStore.notice?.contains("LRCLIB") == true, "a lookup failure is reported")
+    var older = lyricsStore.entries[0]
+    older.id = UUID(); older.trackID = "OLD"; older.date = older.date.addingTimeInterval(-86_400)
+    var broken = older
+    broken.id = UUID(); broken.trackID = "FAIL"; broken.date = older.date.addingTimeInterval(-60)
+    var failedEntry = older
+    failedEntry.id = UUID(); failedEntry.trackID = nil; failedEntry.stage = .failed
+    lyricsStore.buildPlaylist("Music Drop · 2026", from: [lyricsStore.entries[0], older, broken, failedEntry])
+    expect(lyricsStore.playlistBuild?.total == 3, "a playlist build counts the tracks that reached Music")
+    settle(lyricsStore)
+    expect(playlistAdds.map(\.0) == ["FAIL", "OLD", "00000000000000A1"] && playlistAdds.allSatisfy { $0.1 == "Music Drop · 2026" }
+           && lyricsStore.playlistBuild == nil && lyricsStore.notice?.contains("не удалось 1") == true && lyricsStore.entries[0].playlist == nil,
+           "the year's tracks join the playlist oldest first, failures are counted and the history is left alone")
+}
+
 // A chosen playlist receives every new track; existing tracks join it without another import.
 do {
     let playlistDefaults = UserDefaults(suiteName: "musicdrop-tests-" + UUID().uuidString)!

@@ -26,8 +26,13 @@ struct LibraryStats: Equatable {
         Set(entries.filter { $0.stage == .imported }.map { calendar.component(.year, from: $0.date) }).sorted(by: >)
     }
 
+    /// The tracks that reached Music in a year.
+    static func imported(_ entries: [ImportEntry], year: Int, calendar: Calendar = .current) -> [ImportEntry] {
+        entries.filter { $0.stage == .imported && calendar.component(.year, from: $0.date) == year }
+    }
+
     static func make(_ entries: [ImportEntry], year: Int, calendar: Calendar = .current) -> LibraryStats {
-        let imported = entries.filter { $0.stage == .imported && calendar.component(.year, from: $0.date) == year }
+        let imported = imported(entries, year: year, calendar: calendar)
         var months = Array(repeating: 0, count: 12)
         var days: [Date: Int] = [:]
         for entry in imported {
