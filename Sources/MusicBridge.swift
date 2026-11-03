@@ -107,6 +107,49 @@ enum MusicBridge {
                            favoriteError: favorite ? nil : "Трек в медиатеке, но избранное не подтверждено. " + problem)
     }
 
+    /// Creates the playlist on first use and never adds the same track twice.
+    static func playlistSource(id: String, playlist: String) -> String {
+        let name = FileTools.appleScriptLiteral(playlist)
+        return """
+        with timeout of 30 seconds
+            tell application id "com.apple.Music"
+                set foundTracks to (every track of library playlist 1 whose persistent ID is \(FileTools.appleScriptLiteral(id)))
+                if (count of foundTracks) is 0 then error "Трек не найден в медиатеке" number -1728
+                set selectedTrack to item 1 of foundTracks
+                if not (exists user playlist \(name)) then make new user playlist with properties {name:\(name)}
+                set targetPlaylist to user playlist \(name)
+                if not (exists (some track of targetPlaylist whose persistent ID is \(FileTools.appleScriptLiteral(id)))) then
+                    duplicate selectedTrack to targetPlaylist
+                end if
+                return true
+            end tell
+        end timeout
+        """
+    }
+
+    static func addToPlaylist(id: String, playlist: String) throws {
+        try ensureRunning()
+        guard try execute(playlistSource(id: id, playlist: playlist)).booleanValue else {
+            throw DropError.message("«Музыка» не подтвердила добавление в плейлист. Можно повторить без нового импорта.")
+        }
+    }
+
+    static let playlistNamesSource = """
+    with timeout of 10 seconds
+        tell application id "com.apple.Music"
+            return name of every user playlist whose smart is false and special kind is none
+        end tell
+    end timeout
+    """
+
+    /// The user's own playlists, without smart playlists and folders. Never launches Music.
+    static func playlistNames() throws -> [String] {
+        guard !NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.Music").isEmpty else { return [] }
+        let list = try execute(playlistNamesSource)
+        guard list.numberOfItems > 0 else { return list.stringValue.map { [$0] } ?? [] }
+        return (1...list.numberOfItems).compactMap { list.atIndex($0)?.stringValue }
+    }
+
     static func favoriteSource(id: String) -> String {
         """
         with timeout of 30 seconds

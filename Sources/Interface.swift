@@ -67,6 +67,8 @@ struct DropPanel: View {
     @AppStorage(YouTubeAudioFormat.defaultsKey) private var youtubeFormat: YouTubeAudioFormat = .m4a
     @AppStorage(YouTubeFallbackRace.defaultsKey) private var raceFallback = true
     @State private var fileTargeted = false
+    @State private var creatingPlaylist = false
+    @State private var newPlaylistName = ""
 
     var body: some View {
         VStack(spacing: 0) {
@@ -76,7 +78,8 @@ struct DropPanel: View {
                 Text("SoundCloud").tag(PanelNavigation.Tab.soundCloud)
                 Text("YouTube").tag(PanelNavigation.Tab.youTube)
             }
-            .pickerStyle(.segmented).labelsHidden().padding(.horizontal, 20).padding(.bottom, 14)
+            .pickerStyle(.segmented).labelsHidden().padding(.horizontal, 20).padding(.bottom, 8)
+            destinationMenu
             if navigation.tab == .youTube {
                 YouTubePanel(model: youtube, imports: store, navigation: navigation)
             } else if navigation.tab == .soundCloud {
@@ -100,6 +103,43 @@ struct DropPanel: View {
         .animation(reduceMotion ? nil : .easeInOut(duration: 0.18), value: store.dragActive || fileTargeted)
         .animation(reduceMotion ? nil : .easeInOut(duration: 0.18), value: store.settingsVisible)
         .onDrop(of: [.fileURL, .url], isTargeted: $fileTargeted, perform: acceptProviders)
+    }
+
+    /// Where every new track goes: the library alone, or a playlist chosen once for all sources.
+    private var destinationMenu: some View {
+        HStack(spacing: 5) {
+            Image(systemName: store.destination == nil ? "music.note.house" : "music.note.list").foregroundStyle(.secondary)
+            Menu {
+                Button { store.setDestination(nil) } label: {
+                    if store.destination == nil { Label("Только медиатека", systemImage: "checkmark") } else { Text("Только медиатека") }
+                }
+                if !store.availablePlaylists.isEmpty {
+                    Divider()
+                    ForEach(store.availablePlaylists, id: \.self) { name in
+                        Button { store.setDestination(name) } label: {
+                            if store.destination == name { Label(name, systemImage: "checkmark") } else { Text(name) }
+                        }
+                    }
+                }
+                Divider()
+                Button("Новый плейлист…") { newPlaylistName = ""; creatingPlaylist = true }
+            } label: {
+                Text(store.destination.map { "Добавлять в плейлист «\($0)»" } ?? "Добавлять только в медиатеку").lineLimit(1)
+            }
+            .menuStyle(.borderlessButton).fixedSize()
+            .accessibilityLabel("Куда добавлять треки")
+            Spacer()
+        }
+        .font(.system(size: 11)).foregroundStyle(.secondary)
+        .padding(.horizontal, 20).padding(.bottom, 10)
+        .onAppear { store.loadPlaylists() }
+        .alert("Новый плейлист", isPresented: $creatingPlaylist) {
+            TextField("Название", text: $newPlaylistName)
+            Button("Создать") { store.setDestination(newPlaylistName) }
+            Button("Отмена", role: .cancel) {}
+        } message: {
+            Text("Плейлист появится в «Музыке» вместе с первым добавленным треком.")
+        }
     }
 
     private var header: some View {
@@ -321,7 +361,7 @@ private struct HistoryRow: View {
     private var warning: Bool {
         entry.stage == .failed || entry.stage == .needsReview || CloudState.isWarning(entry.cloudStatus)
             || entry.favoriteError != nil || entry.isFavorite == false
-            || (entry.cloudUpdateError != nil && !CloudState.isReady(entry.cloudStatus))
+            || (entry.cloudUpdateError != nil && !CloudState.isReady(entry.cloudStatus)) || entry.playlistError != nil
     }
     private var subtitle: String {
         if store.updatingFavorites.contains(entry.id) { return "Добавляем в избранное…" }
@@ -386,6 +426,20 @@ private struct HistoryRow: View {
             if let problem = entry.favoriteError {
                 Text(problem).font(.system(size: 11)).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true).padding(.leading, 44)
+            }
+            if entry.stage == .imported, let playlist = entry.playlist {
+                if let problem = entry.playlistError {
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("Не удалось добавить в «\(playlist)»: " + problem).font(.system(size: 11)).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Button("Повторить добавление в плейлист") { store.addToPlaylist(entry, playlist: playlist) }
+                            .disabled(store.updatingPlaylists.contains(entry.id))
+                    }
+                    .font(.system(size: 11)).buttonStyle(.borderless).padding(.leading, 44)
+                } else {
+                    Label("В плейлисте «\(playlist)»", systemImage: "music.note.list")
+                        .font(.system(size: 10)).foregroundStyle(.secondary).padding(.leading, 44)
+                }
             }
             if entry.stage == .imported, CloudState.canAutoRetry(entry.cloudStatus) {
                 if let problem = entry.cloudUpdateError {

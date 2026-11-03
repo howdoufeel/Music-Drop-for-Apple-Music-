@@ -27,6 +27,9 @@ struct ImportEntry: Codable, Identifiable, Equatable {
     var soundCloudURL: URL?
     var youtubeID: String?
     var youtubeURL: URL?
+    /// The playlist the track goes into after the import; nil keeps it in the library only.
+    var playlist: String?
+    var playlistError: String?
     var error: String?
 
     var cloudRetryMessage: String? {

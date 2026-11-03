@@ -25,6 +25,8 @@ struct ImportServices {
     var cloudAccessGranted: () -> Bool = { CloudUpdateBridge.isTrusted }
     var musicIsRunning: () -> Bool = { !NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.Music").isEmpty }
     var prepareMusic: () throws -> Void = MusicBridge.prepare
+    var addToPlaylist: (String, String) throws -> Void = MusicBridge.addToPlaylist
+    var playlistNames: () throws -> [String] = MusicBridge.playlistNames
 }
 
 /// Coalesces history writes off the main thread; the newest snapshot always wins.
@@ -64,6 +66,11 @@ private final class HistoryWriter {
     var cloudUpdateInProgress = false
     /// Music is launching for an import or a download that will need it.
     var musicStarting = false
+    /// Where new tracks go after the import; nil keeps them in the library only.
+    private(set) var destination: String?
+    /// The user's playlists as Music last listed them.
+    private(set) var availablePlaylists: [String] = []
+    var updatingPlaylists: Set<UUID> = []
     // Derived from entries once per change, so views and timers never rescan the history.
     private(set) var activeImportCount = 0
     private(set) var successfulCount = 0
@@ -88,9 +95,12 @@ private final class HistoryWriter {
     /// True while SoundCloud or YouTube audio is downloading: its import comes next, so Music is
     /// kept free of status reads and cloud requests until then.
     @ObservationIgnored var downloadsActive: () -> Bool = { false }
+    private let defaults: UserDefaults
+    static let destinationKey = "DestinationPlaylist"
+    static let playlistsKey = "KnownPlaylists"
 
     var activeCount: Int {
-        activeImportCount + updatingFavorites.count + (cloudUpdateInProgress ? 1 : 0)
+        activeImportCount + updatingFavorites.count + updatingPlaylists.count + (cloudUpdateInProgress ? 1 : 0)
     }
     /// Newest entry for a source track, ignoring ones removed from Music.
     func entry(soundCloudID id: String) -> ImportEntry? { soundCloudEntries[id] }
@@ -98,7 +108,10 @@ private final class HistoryWriter {
     private var downloadsDirectory: URL { directory.appendingPathComponent("Downloads", isDirectory: true) }
 
     init(directory: URL? = nil, preview: Bool = false, services: ImportServices = .init(), startTimer: Bool = true,
-         now: @escaping () -> Date = Date.init) {
+         now: @escaping () -> Date = Date.init, defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        destination = defaults.string(forKey: Self.destinationKey)?.nonEmpty
+        availablePlaylists = defaults.stringArray(forKey: Self.playlistsKey) ?? []
         self.preview = preview
         self.services = services
         self.automaticMonitoring = startTimer
@@ -221,7 +234,7 @@ private final class HistoryWriter {
             guard !entries.contains(where: {
                 $0.sourcePath == url.path && ($0.stage == .queued || $0.stage == .importing)
             }) else { continue }
-            let entry = ImportEntry(sourcePath: url.path, title: url.deletingPathExtension().lastPathComponent)
+            let entry = ImportEntry(sourcePath: url.path, title: url.deletingPathExtension().lastPathComponent, playlist: destination)
             entries.insert(entry, at: 0)
             save()
             performImport(entry)
@@ -236,33 +249,40 @@ private final class HistoryWriter {
         performImport(entries[index])
     }
 
-    func acceptSoundCloud(_ url: URL, track: SoundCloudTrack) {
+    /// `playlist` overrides the chosen destination, as when a whole set goes into its own playlist.
+    func acceptSoundCloud(_ url: URL, track: SoundCloudTrack, playlist: String? = nil) {
         guard !preview else { return }
+        let target = playlist ?? destination
         if let existing = entries.first(where: {
             $0.soundCloudID == track.id && $0.stage == .imported && $0.cloudStatus != "missing"
         }) {
             notice = "«\(existing.title)» уже в медиатеке. Обновляем избранное и облако."
             markFavorite(existing)
+            if let target { addToPlaylist(existing, playlist: target) }
             return
         }
         let entry = ImportEntry(sourcePath: url.path, title: track.title,
-                                soundCloudID: track.id, soundCloudURL: track.url)
+                                soundCloudID: track.id, soundCloudURL: track.url, playlist: target)
         entries.insert(entry, at: 0)
         save()
         performImport(entry)
     }
 
-    func acceptYouTube(_ url: URL, track: YouTubeTrack) {
+    func acceptYouTube(_ url: URL, track: YouTubeTrack, playlist: String? = nil) {
         guard !preview else { return }
+        let target = playlist ?? destination
         if let existing = entries.first(where: {
             $0.youtubeID == track.id && $0.cloudStatus != "missing"
         }) {
-            if existing.stage == .imported { markFavorite(existing) }
+            if existing.stage == .imported {
+                markFavorite(existing)
+                if let target { addToPlaylist(existing, playlist: target) }
+            }
             else if existing.stage == .failed { retry(existing) }
             return
         }
         let entry = ImportEntry(sourcePath: url.path, title: track.title,
-                                youtubeID: track.id, youtubeURL: track.url)
+                                youtubeID: track.id, youtubeURL: track.url, playlist: target)
         entries.insert(entry, at: 0)
         save()
         performImport(entry)
@@ -322,6 +342,44 @@ private final class HistoryWriter {
         }
     }
 
+    func setDestination(_ playlist: String?) {
+        destination = playlist?.nonEmpty
+        defaults.set(destination, forKey: Self.destinationKey)
+        if let destination, !availablePlaylists.contains(destination) { rememberPlaylists(availablePlaylists + [destination]) }
+    }
+
+    /// Refreshes the playlist menu from Music, only while Music is already running.
+    func loadPlaylists() {
+        guard !preview, services.musicIsRunning() else { return }
+        queue.async { [weak self] in
+            guard let self, let names = try? self.services.playlistNames() else { return }
+            DispatchQueue.main.async { self.rememberPlaylists(names + [self.destination].compactMap { $0 }) }
+        }
+    }
+
+    private func rememberPlaylists(_ names: [String]) {
+        var seen: Set<String> = []
+        let unique = names.filter { seen.insert($0).inserted }.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+        if unique != availablePlaylists { availablePlaylists = unique }
+        defaults.set(unique, forKey: Self.playlistsKey)
+    }
+
+    /// Puts an imported track into a playlist without importing it again.
+    func addToPlaylist(_ entry: ImportEntry, playlist: String) {
+        guard !preview, entry.stage == .imported, let trackID = entry.trackID, !updatingPlaylists.contains(entry.id) else { return }
+        updatingPlaylists.insert(entry.id)
+        queue.async { [weak self] in
+            guard let self else { return }
+            var problem: String?
+            do { try self.services.addToPlaylist(trackID, playlist) }
+            catch { problem = error.localizedDescription }
+            DispatchQueue.main.async {
+                self.updatingPlaylists.remove(entry.id)
+                self.update(entry.id) { $0.playlist = playlist; $0.playlistError = problem }
+            }
+        }
+    }
+
     /// Called when a download starts: Music launches while the audio is still downloading.
     func prepareMusic() {
         guard !preview, !musicStarting, !services.musicIsRunning() else { return }
@@ -373,6 +431,7 @@ private final class HistoryWriter {
                         self.save()
                         if existing.stage == .imported {
                             self.markFavorite(existing)
+                            if let playlist = entry.playlist { self.addToPlaylist(existing, playlist: playlist) }
                         } else {
                             self.beginCloudUpdate()
                         }
@@ -394,6 +453,12 @@ private final class HistoryWriter {
                     if launching { DispatchQueue.main.async { self.musicStarting = false } }
                     throw error
                 }
+                // The playlist step never undoes a successful import; its error is shown on the row.
+                var playlistProblem: String?
+                if let playlist = entry.playlist {
+                    do { try self.services.addToPlaylist(result.id, playlist) }
+                    catch { playlistProblem = error.localizedDescription }
+                }
                 // Timings in Console.app (process "Music Drop") show where an import waited.
                 NSLog("Music Drop import: queued %.2f s, file checks %.2f s, Music %.2f s, Music launched: %d",
                       started.timeIntervalSince(enqueued), adding.timeIntervalSince(started), Date().timeIntervalSince(adding),
@@ -404,6 +469,7 @@ private final class HistoryWriter {
                         $0.trackID = result.id; $0.title = result.title
                         $0.cloudStatus = result.cloudStatus; $0.stage = .imported; $0.error = nil
                         $0.isFavorite = result.isFavorite; $0.favoriteError = result.favoriteError
+                        $0.playlistError = playlistProblem
                     }
                     self.requestCloudUpdate(for: [entry.id])
                 }

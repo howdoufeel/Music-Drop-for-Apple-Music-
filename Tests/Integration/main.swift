@@ -119,6 +119,10 @@ var scriptError: NSDictionary?
 expect(script.compileAndReturnError(&scriptError), "real import AppleScript compiles with quoted Unicode paths: \(String(describing: scriptError))")
 let favoriteScript = NSAppleScript(source: MusicBridge.favoriteSource(id: "00000000000000A1"))!
 expect(favoriteScript.compileAndReturnError(&scriptError), "favorite-only AppleScript compiles without executing")
+let playlistScript = NSAppleScript(source: MusicBridge.playlistSource(id: "00000000000000A1", playlist: "Плейлист \"в кавычках\""))!
+expect(playlistScript.compileAndReturnError(&scriptError), "the playlist AppleScript compiles with a quoted Unicode name: \(String(describing: scriptError))")
+let playlistNamesScript = NSAppleScript(source: MusicBridge.playlistNamesSource)!
+expect(playlistNamesScript.compileAndReturnError(&scriptError), "the playlist list AppleScript compiles: \(String(describing: scriptError))")
 expect(!CloudState.isReady("unknown") && CloudState.isReady("matched"), "cloud status does not claim unconfirmed upload")
 
 // Exercise the production AVFoundation validator on a generated silent MP3.
@@ -237,6 +241,61 @@ do {
            "a slow cloud request does not hold back the next import")
     cloudGate.signal(); cloudGate.signal()
     settle(slowStore)
+}
+
+// A chosen playlist receives every new track; existing tracks join it without another import.
+do {
+    let playlistDefaults = UserDefaults(suiteName: "musicdrop-tests-" + UUID().uuidString)!
+    var playlistCalls: [(String, String)] = []
+    var playlistFailure: Error?
+    var playlistServices = services
+    playlistServices.addToPlaylist = { id, name in
+        playlistCalls.append((id, name))
+        if let playlistFailure { throw playlistFailure }
+    }
+    playlistServices.playlistNames = { ["Лето", "Бег"] }
+    playlistServices.musicIsRunning = { true }
+    let playlistRoot = root.appendingPathComponent("PlaylistState")
+    let playlistStore = ImportStore(directory: playlistRoot, services: playlistServices, startTimer: false, defaults: playlistDefaults)
+    expect(playlistStore.destination == nil, "new installs add to the library only")
+    playlistStore.setDestination("Новинки")
+    let playlistFile = root.appendingPathComponent("playlist-first.mp3")
+    try Data("playlist-first".utf8).write(to: playlistFile)
+    playlistStore.accept([playlistFile])
+    settle(playlistStore)
+    expect(playlistStore.entries[0].stage == .imported && playlistStore.entries[0].playlist == "Новинки" && playlistCalls.count == 1
+           && playlistCalls[0].0 == "00000000000000A1" && playlistCalls[0].1 == "Новинки", "an import goes into the chosen playlist by its Music ID")
+    let reopened = ImportStore(directory: playlistRoot, services: playlistServices, startTimer: false, defaults: playlistDefaults)
+    expect(reopened.destination == "Новинки" && reopened.availablePlaylists.contains("Новинки"), "the chosen playlist is remembered")
+    playlistStore.loadPlaylists()
+    let listDeadline = Date().addingTimeInterval(3)
+    while !playlistStore.availablePlaylists.contains("Бег"), Date() < listDeadline { RunLoop.main.run(until: Date().addingTimeInterval(0.01)) }
+    expect(playlistStore.availablePlaylists == ["Бег", "Лето", "Новинки"], "the menu lists Music's playlists together with the chosen one, sorted")
+    playlistFailure = DropError.message("Плейлист занят")
+    let importsBeforeFailure = imports
+    let failingPlaylistFile = root.appendingPathComponent("playlist-second.mp3")
+    try Data("playlist-second".utf8).write(to: failingPlaylistFile)
+    playlistStore.accept([failingPlaylistFile])
+    settle(playlistStore)
+    expect(playlistStore.entries[0].stage == .imported && playlistStore.entries[0].playlistError == "Плейлист занят" && imports == importsBeforeFailure + 1,
+           "a failed playlist step keeps the successful import and explains itself")
+    playlistFailure = nil
+    playlistStore.addToPlaylist(playlistStore.entries[0], playlist: "Новинки")
+    settle(playlistStore)
+    expect(playlistStore.entries[0].playlistError == nil && imports == importsBeforeFailure + 1, "retrying the playlist step does not import again")
+    let callsBeforeRepeat = playlistCalls.count
+    let scTrackForPlaylist = SoundCloudTrack(id: "playlist-sc", title: "SC", artist: "Artist", url: URL(string: "https://soundcloud.com/a/sc")!)
+    let scPlaylistFile = root.appendingPathComponent("playlist-sc.m4a")
+    try Data("playlist-sc".utf8).write(to: scPlaylistFile)
+    playlistStore.acceptSoundCloud(scPlaylistFile, track: scTrackForPlaylist, playlist: "Сет")
+    settle(playlistStore)
+    expect(playlistCalls.last?.1 == "Сет" && playlistStore.entries[0].playlist == "Сет", "a set's own playlist overrides the chosen destination")
+    playlistStore.acceptSoundCloud(scPlaylistFile, track: scTrackForPlaylist, playlist: "Ещё один")
+    settle(playlistStore)
+    expect(playlistCalls.count == callsBeforeRepeat + 2 && playlistCalls.last?.1 == "Ещё один" && imports == importsBeforeFailure + 2,
+           "adding a track that is already in the library only puts it into the playlist")
+    playlistStore.setDestination(nil)
+    expect(playlistStore.destination == nil && playlistDefaults.string(forKey: ImportStore.destinationKey) == nil, "the library-only choice is remembered too")
 }
 
 // While tracks download, Music is launched for them and kept free of cloud work.
@@ -968,7 +1027,7 @@ if CommandLine.arguments.count > 1 {
     }
     var artworkRequests: [[URL]] = []
     let artService = SoundCloudService(helper: root.appendingPathComponent("no-helper"), ffmpeg: noFFmpeg, cache: nativeCache, searchClient: realClient,
-                                       artwork: { urls, _ in artworkRequests.append(urls); return coverJPEG })
+                                       artwork: { urls, _ in artworkRequests.append(urls); return CoverImage.squareJPEG(coverJPEG) })
     var artTrack = nativeResults[0]
     artTrack.genre = "House"; artTrack.year = 2021; artTrack.album = "Альбом"
     let artFile = try artService.download(artTrack, directory: root.appendingPathComponent("ArtHLS"), cancellation: SoundCloudCancellation(), stage: { _ in })
