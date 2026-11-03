@@ -49,13 +49,14 @@ final class StatusDropTarget: NSView {
     override func concludeDragOperation(_ sender: NSDraggingInfo?) { onExit?() }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSWindowDelegate {
     var statusItem: NSStatusItem!
     let popover = NSPopover()
     var store: ImportStore!
     var soundCloud: SoundCloudStore!
     var youtube: YouTubeStore!
     var navigation: PanelNavigation!
+    let previewPlayer = PreviewPlayer()
     var previewWindow: NSWindow?
     var globalMonitor: Any?
     var localMonitor: Any?
@@ -68,6 +69,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         soundCloud = SoundCloudStore(preview: preview)
         youtube = YouTubeStore(preview: preview)
         navigation = PanelNavigation(soundCloud: soundCloud, youtube: youtube)
+        soundCloud.onPreview = { [weak self] url in
+            if let url { self?.previewPlayer.play(url) } else { self?.previewPlayer.stop() }
+        }
+        previewPlayer.onFinish = { [weak self] failed in self?.soundCloud.previewEnded(failed: failed) }
         youtube.onReady = { [weak self] file, track in self?.store.acceptYouTube(file, track: track) }
         youtube.onActivity = { [weak self] in self?.updateActivity() }
         youtube.shouldPrefetch = { [weak self] track in self?.store.entry(youTubeID: track.id) == nil }
@@ -211,8 +216,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // Built on demand, so a hidden popover never re-renders alongside the main window.
         if popover.contentViewController == nil {
             popover.contentSize = NSSize(width: 380, height: 540)
-            popover.contentViewController = NSHostingController(rootView: DropPanel(store: store, soundCloud: soundCloud,
-                                                                                   youtube: youtube, navigation: navigation))
+            popover.contentViewController = NSHostingController(rootView: DropPanel(store: store, soundCloud: soundCloud, youtube: youtube,
+                                                                                   navigation: navigation, player: previewPlayer))
         }
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         if activate { popover.contentViewController?.view.window?.makeKeyAndOrderFront(nil) }
@@ -221,6 +226,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     func popoverDidClose(_ notification: Notification) {
         popover.contentViewController = nil
+        // Nothing would be left on screen to pause the music.
+        if previewWindow?.isVisible != true { soundCloud.stopPreview() }
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        if !popover.isShown { soundCloud.stopPreview() }
     }
 
     func toggle() {
@@ -241,7 +252,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         window.titlebarAppearsTransparent = true
         window.isMovableByWindowBackground = true
         window.contentView = NSHostingView(rootView: DropPanel(store: store, soundCloud: soundCloud, youtube: youtube,
-                                                               navigation: navigation).padding(.top, 24))
+                                                               navigation: navigation, player: previewPlayer).padding(.top, 24))
+        window.delegate = self
         window.setContentSize(NSSize(width: 380, height: 564))
         window.isReleasedWhenClosed = false
         window.center()

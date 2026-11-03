@@ -66,9 +66,12 @@ protocol SoundCloudProviding {
                   stage: @escaping (String) -> Void, progress: @escaping (Double) -> Void) throws -> URL
     /// Gets the connection ready before the first search; may block, call it off the main thread.
     func prewarm()
+    /// A stream to listen to before adding; nil when SoundCloud offers nothing playable.
+    func previewStream(for track: SoundCloudTrack, cancellation: SoundCloudCancellation) throws -> SoundCloudPreview?
 }
 
 extension SoundCloudProviding {
+    func previewStream(for track: SoundCloudTrack, cancellation: SoundCloudCancellation) throws -> SoundCloudPreview? { nil }
     func download(_ track: SoundCloudTrack, directory: URL, cancellation: SoundCloudCancellation,
                   stage: @escaping (String) -> Void, progress: @escaping (Double) -> Void) throws -> URL {
         try download(track, directory: directory, cancellation: cancellation, stage: stage)
@@ -180,6 +183,10 @@ final class SoundCloudService: SoundCloudProviding {
         searchResults[target] = (now(), tracks)
         resultLock.unlock()
         return tracks
+    }
+
+    func previewStream(for track: SoundCloudTrack, cancellation: SoundCloudCancellation) throws -> SoundCloudPreview? {
+        try searchClient.previewStream(for: track, cancellation: cancellation)
     }
 
     func prewarm() {

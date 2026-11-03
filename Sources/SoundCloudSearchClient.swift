@@ -6,6 +6,12 @@ struct SoundCloudAudioSource {
     var isHLS = false
 }
 
+/// A stream for listening in the app; `isClip` marks SoundCloud's 30-second preview of a restricted track.
+struct SoundCloudPreview: Equatable {
+    let url: URL
+    let isClip: Bool
+}
+
 /// A media playlist reduced to the parts the native downloader can join byte for byte.
 struct HLSPlaylist {
     var initSegment: URL?
@@ -109,6 +115,56 @@ final class SoundCloudSearchClient {
                                      authorization: root["track_authorization"] as? String, clientID: clientID, cancellation: cancellation)
         }
         return nil
+    }
+
+    /// Listening needs only the signed stream; AVFoundation plays the HLS playlist itself.
+    func previewStream(for track: SoundCloudTrack, cancellation: SoundCloudCancellation) throws -> SoundCloudPreview? {
+        guard track.id.range(of: "^[0-9]+$", options: .regularExpression) != nil else { return nil }
+        if let hint = track.stream {
+            let clientID = try credential(refresh: false, cancellation: cancellation)
+            if let source = try resolveStream(hint.transcoding, fileExtension: hint.fileExtension, isHLS: hint.isHLS,
+                                              authorization: hint.authorization, clientID: clientID, cancellation: cancellation) {
+                return SoundCloudPreview(url: source.url, isClip: false)
+            }
+        }
+        for attempt in 0...1 {
+            let clientID = try credential(refresh: attempt > 0, cancellation: cancellation)
+            var metadataURL = URLComponents(string: "https://api-v2.soundcloud.com/tracks/" + track.id)!
+            metadataURL.queryItems = [URLQueryItem(name: "client_id", value: clientID)]
+            let (data, response) = try request(metadataURL.url!, cancellation: cancellation)
+            if response.statusCode == 429 { throw SoundCloudError.rateLimited }
+            if [401, 403].contains(response.statusCode), attempt == 0 { continue }
+            guard response.statusCode == 200,
+                  let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  (root["id"] as? NSNumber)?.stringValue == track.id || root["id"] as? String == track.id,
+                  let candidate = Self.previewCandidate(root),
+                  let source = try resolveStream(candidate.source.url, fileExtension: candidate.source.fileExtension,
+                                                 isHLS: candidate.source.isHLS, authorization: root["track_authorization"] as? String,
+                                                 clientID: clientID, cancellation: cancellation) else { return nil }
+            return SoundCloudPreview(url: source.url, isClip: candidate.isClip)
+        }
+        return nil
+    }
+
+    /// Unlike downloads, listening accepts a preview clip and tracks with original downloads.
+    /// AVFoundation plays AAC and MP3 over HLS or plain HTTPS, but not the encrypted variants.
+    static func previewCandidate(_ root: [String: Any]) -> (source: SoundCloudAudioSource, isClip: Bool)? {
+        guard root["kind"] as? String == "track", root["policy"] as? String != "BLOCK",
+              let media = root["media"] as? [String: Any], let transcodings = media["transcodings"] as? [[String: Any]] else { return nil }
+        var best: (source: SoundCloudAudioSource, isClip: Bool, score: Int)?
+        for item in transcodings {
+            guard let format = item["format"] as? [String: Any], let transport = format["protocol"] as? String,
+                  ["hls", "progressive"].contains(transport), let preset = item["preset"] as? String,
+                  preset.hasPrefix("aac_") || preset.hasPrefix("mp3_"),
+                  let rawURL = item["url"] as? String, let url = URL(string: rawURL), isMediaURL(url),
+                  url.host?.lowercased() == "api-v2.soundcloud.com" else { continue }
+            let clip = item["snipped"] as? Bool == true
+            let aac = preset.hasPrefix("aac_")
+            let score = (clip ? 0 : 100) + (aac ? 10 : 0) + (item["quality"] as? String == "hq" ? 5 : 0) + (transport == "hls" ? 1 : 0)
+            guard score > best?.score ?? -1 else { continue }
+            best = (SoundCloudAudioSource(url: url, fileExtension: aac ? "m4a" : "mp3", isHLS: transport == "hls"), clip, score)
+        }
+        return best.map { ($0.source, $0.isClip) }
     }
 
     /// Exchanges a transcoding endpoint for the signed media URL.

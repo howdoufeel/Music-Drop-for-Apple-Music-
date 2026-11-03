@@ -5,6 +5,7 @@ struct SoundCloudPanel: View {
     @Bindable var model: SoundCloudStore
     var imports: ImportStore
     var navigation: PanelNavigation
+    var player: PreviewPlayer
     @FocusState private var searchFocused: Bool
 
     var body: some View {
@@ -66,13 +67,41 @@ struct SoundCloudPanel: View {
         else { model.search() }
     }
 
+    /// Play and pause sit on the artwork, so every result can be heard without leaving the list.
+    private func previewButton(_ track: SoundCloudTrack) -> some View {
+        let active = model.previewID == track.id
+        let playing = active && player.isPlaying
+        let waiting = active && (model.previewLoading || player.isBuffering)
+        return Button {
+            if active, !model.previewLoading { player.toggle() } else { model.startPreview(track) }
+        } label: {
+            ZStack {
+                Circle().fill(Color.black.opacity(active ? 0.55 : 0.35)).frame(width: 26, height: 26)
+                if waiting {
+                    ProgressView().controlSize(.mini).environment(\.colorScheme, .dark)
+                } else {
+                    Image(systemName: playing ? "pause.fill" : "play.fill")
+                        .font(.system(size: 11, weight: .bold)).foregroundStyle(.white)
+                }
+            }
+            .frame(width: 44, height: 44)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(playing ? "Пауза" : "Прослушать")
+        .accessibilityLabel(playing ? "Пауза: \(track.title)" : "Прослушать \(track.title)")
+    }
+
     private func trackRow(_ track: SoundCloudTrack) -> some View {
         let entry = imports.entry(soundCloudID: track.id)
         let working = entry?.stage == .queued || entry?.stage == .importing
         let added = entry?.stage == .imported
         return VStack(alignment: .leading, spacing: 7) {
             HStack(alignment: .top, spacing: 10) {
-                ArtworkView(url: track.artwork, symbol: "waveform", tint: .orange)
+                ZStack {
+                    ArtworkView(url: track.artwork, symbol: "waveform", tint: .orange)
+                    previewButton(track)
+                }
                 VStack(alignment: .leading, spacing: 4) {
                     Text(track.title).font(.system(size: 12, weight: .medium)).lineLimit(2)
                     Text(track.artist).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
@@ -99,6 +128,12 @@ struct SoundCloudPanel: View {
                     .controlSize(.small).buttonStyle(.bordered)
                     .accessibilityLabel("Добавить \(track.title) в Apple Music")
                 }
+            }
+            if model.previewID == track.id, !model.previewLoading {
+                PreviewProgress(player: player, isClip: model.previewIsClip).padding(.leading, 54)
+            } else if let problem = model.previewErrors[track.id] {
+                Text(problem).font(.system(size: 10)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true).padding(.leading, 54)
             }
             if let state = model.downloadStates[track.id] {
                 DownloadStatus(state: state, progress: model.downloadProgress[track.id]).padding(.leading, 54)
@@ -138,5 +173,37 @@ struct SoundCloudPanel: View {
                     .buttonStyle(.borderless).font(.system(size: 10)).foregroundStyle(.secondary)
             }
         }.padding(.vertical, 12)
+    }
+}
+
+/// Position of the track being heard; a click on the bar jumps there.
+private struct PreviewProgress: View {
+    let player: PreviewPlayer
+    let isClip: Bool
+
+    var body: some View {
+        HStack(spacing: 8) {
+            GeometryReader { proxy in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.primary.opacity(0.12))
+                    Capsule().fill(Color.orange).frame(width: proxy.size.width * player.progress)
+                }
+                .contentShape(Rectangle())
+                .onTapGesture { location in player.seek(to: location.x / max(1, proxy.size.width)) }
+            }
+            .frame(height: 4)
+            Text(Self.time(player.progress * player.duration) + " / " + Self.time(player.duration)).monospacedDigit()
+            if isClip { Text("фрагмент").help("SoundCloud открывает для этого трека только отрывок") }
+        }
+        .font(.system(size: 10)).foregroundStyle(.secondary)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Прослушивание")
+        .accessibilityValue(Self.time(player.progress * player.duration) + " из " + Self.time(player.duration))
+    }
+
+    static func time(_ seconds: Double) -> String {
+        guard seconds.isFinite, seconds >= 0 else { return "0:00" }
+        let whole = Int(seconds)
+        return String(format: "%d:%02d", whole / 60, whole % 60)
     }
 }

@@ -62,6 +62,7 @@ struct DropPanel: View {
     var soundCloud: SoundCloudStore
     var youtube: YouTubeStore
     @Bindable var navigation: PanelNavigation
+    var player: PreviewPlayer
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @AppStorage(YouTubeAudioFormat.defaultsKey) private var youtubeFormat: YouTubeAudioFormat = .m4a
     @AppStorage(YouTubeFallbackRace.defaultsKey) private var raceFallback = true
@@ -79,7 +80,7 @@ struct DropPanel: View {
             if navigation.tab == .youTube {
                 YouTubePanel(model: youtube, imports: store, navigation: navigation)
             } else if navigation.tab == .soundCloud {
-                SoundCloudPanel(model: soundCloud, imports: store, navigation: navigation)
+                SoundCloudPanel(model: soundCloud, imports: store, navigation: navigation, player: player)
             } else {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {

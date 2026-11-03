@@ -715,6 +715,31 @@ let staleClient = SoundCloudSearchClient(cache: nativeCache, clientID: String(re
 let staleAudio = try staleClient.audioStream(for: hintedTrack, cancellation: SoundCloudCancellation())
 expect(staleAudio?.url == mediaURL && staleRequests.count == 3 && staleRequests[1].url!.path.hasPrefix("/tracks/"),
        "an expired search authorization falls back to fresh track metadata")
+
+// Listening: any playable stream will do, including SoundCloud's 30-second clip.
+var clipMetadata = audioMetadata
+clipMetadata["media"] = ["transcodings":[transcoding("aac_160k", snipped:true), transcoding("mp3_1_0", transport:"progressive", snipped:true)]]
+expect(SoundCloudSearchClient.nativeCandidate(clipMetadata) == nil && SoundCloudSearchClient.previewCandidate(clipMetadata)?.isClip == true
+       && SoundCloudSearchClient.previewCandidate(clipMetadata)?.source.url.path.contains("aac_160k") == true,
+       "a preview-only track can still be heard as a clip, preferring AAC")
+var mixedPreview = audioMetadata
+mixedPreview["media"] = ["transcodings":[transcoding("aac_160k", snipped:true), transcoding("mp3_1_0", transport:"progressive")]]
+expect(SoundCloudSearchClient.previewCandidate(mixedPreview)?.isClip == false && SoundCloudSearchClient.previewCandidate(mixedPreview)?.source.isHLS == false,
+       "the full track is preferred over a clip even in another format")
+var originalPreview = audioMetadata
+originalPreview["downloadable"] = true; originalPreview["has_downloads_left"] = true
+expect(SoundCloudSearchClient.previewCandidate(originalPreview) != nil, "tracks with an original download can still be heard")
+var protectedPreview = audioMetadata
+protectedPreview["media"] = ["transcodings":[transcoding("aac_256k", transport:"ctr-hls"), transcoding("opus_64k")]]
+expect(SoundCloudSearchClient.previewCandidate(protectedPreview) == nil, "encrypted and Opus-only streams are not offered for listening")
+audioRequests = []
+let hintedPreview = try audioClient.previewStream(for: hintedTrack, cancellation: SoundCloudCancellation())
+expect(hintedPreview == SoundCloudPreview(url: mediaURL, isClip: false) && audioRequests.count == 1,
+       "listening to a search result needs one request for the signed stream")
+audioRequests = []
+let metadataPreview = try audioClient.previewStream(for: nativeResults[0], cancellation: SoundCloudCancellation())
+expect(metadataPreview?.url == mediaURL && audioRequests.count == 2 && audioRequests[0].url!.path.hasPrefix("/tracks/"),
+       "without a stream list the preview asks for track metadata first")
 let beforeAudioRateLimit = limitedRequests
 do { _ = try limitedClient.audioStream(for:nativeResults[0],cancellation:SoundCloudCancellation()); fatalError("Audio rate limit ignored") }
 catch SoundCloudError.rateLimited {
@@ -930,6 +955,65 @@ final class ParallelDownloadFixture: SoundCloudProviding {
         return directory.appendingPathComponent(track.id+".m4a")
     }
 }
+final class PreviewFixture: SoundCloudProviding {
+    let lock = NSLock()
+    var calls: [String] = []
+    func search(_ input: String, cancellation: SoundCloudCancellation) throws -> [SoundCloudTrack] {
+        [SoundCloudTrack(id: input, title: input, artist: "Artist", url: URL(string: "https://soundcloud.com/artist/\(input)")!)]
+    }
+    func download(_ track: SoundCloudTrack, directory: URL, cancellation: SoundCloudCancellation, stage: @escaping (String) -> Void) throws -> URL {
+        directory.appendingPathComponent(track.id + ".m4a")
+    }
+    func previewStream(for track: SoundCloudTrack, cancellation: SoundCloudCancellation) throws -> SoundCloudPreview? {
+        lock.lock(); calls.append(track.id); lock.unlock()
+        if track.id == "slow" { Thread.sleep(forTimeInterval: 0.3) }
+        if track.id == "broken" { throw SoundCloudError.message("Нет связи") }
+        if track.id == "silent" { return nil }
+        return SoundCloudPreview(url: URL(string: "https://playback.media-streaming.soundcloud.cloud/\(track.id)/playlist.m3u8")!, isClip: track.id == "clip")
+    }
+}
+let previewProvider = PreviewFixture()
+let previewModel = SoundCloudStore(service: previewProvider, directory: root.appendingPathComponent("PreviewModel"))
+var played: [URL?] = []
+previewModel.onPreview = { played.append($0) }
+func previewTrack(_ id: String) -> SoundCloudTrack {
+    SoundCloudTrack(id: id, title: id, artist: "Artist", url: URL(string: "https://soundcloud.com/artist/\(id)")!)
+}
+previewModel.startPreview(previewTrack("first"))
+expect(previewModel.previewID == "first" && previewModel.previewLoading, "starting a preview marks the track as loading at once")
+waitUI { !previewModel.previewLoading }
+expect(played == [URL(string: "https://playback.media-streaming.soundcloud.cloud/first/playlist.m3u8")!] && previewModel.previewID == "first",
+       "the resolved stream is handed to the player")
+previewModel.startPreview(previewTrack("slow"))
+previewModel.startPreview(previewTrack("clip"))
+waitUI { !previewModel.previewLoading }
+RunLoop.main.run(until: Date().addingTimeInterval(0.4))
+expect(played[1] == nil && !played.contains { $0?.path.contains("/slow/") == true } && played.last??.path.contains("/clip/") == true
+       && previewModel.previewID == "clip" && previewModel.previewIsClip,
+       "switching tracks stops the previous one and a slower earlier answer never starts playing")
+previewModel.previewEnded(failed: false)
+expect(previewModel.previewID == nil && played.last == .some(nil) && previewModel.previewErrors.isEmpty, "a finished stream clears the preview without an error")
+for (id, expected) in [("broken", "Нет связи"), ("silent", "SoundCloud не даёт прослушать этот трек.")] {
+    previewModel.startPreview(previewTrack(id))
+    waitUI { !previewModel.previewLoading }
+    expect(previewModel.previewID == nil && previewModel.previewErrors[id] == expected, "a track that cannot be heard explains why")
+}
+previewModel.startPreview(previewTrack("first"))
+waitUI { !previewModel.previewLoading }
+previewModel.previewEnded(failed: true)
+expect(previewModel.previewErrors["first"] != nil && previewModel.previewID == nil, "a stream the player cannot open is reported on its row")
+previewModel.query = "listed"; previewModel.search()
+waitUI { !previewModel.isSearching }
+previewModel.startPreview(previewModel.results[0])
+waitUI { !previewModel.previewLoading }
+let callsBeforeSearch = played.count
+previewModel.query = "listed"; previewModel.search()
+waitUI { !previewModel.isSearching }
+expect(previewModel.previewID == "listed" && played.count == callsBeforeSearch, "a new search keeps playing a track that is still in the results")
+previewModel.query = "other"; previewModel.search()
+waitUI { !previewModel.isSearching }
+expect(previewModel.previewID == nil && played.last == .some(nil), "listening stops when its track leaves the results")
+
 let parallelProvider = ParallelDownloadFixture()
 let parallelStore = SoundCloudStore(service:parallelProvider,directory:root.appendingPathComponent("ParallelAudio"))
 let parallelTracks = (0..<3).map { SoundCloudTrack(id:"parallel-\($0)",title:"Parallel \($0)",artist:"Artist",url:URL(string:"https://soundcloud.com/artist/track-\($0)")!) }
