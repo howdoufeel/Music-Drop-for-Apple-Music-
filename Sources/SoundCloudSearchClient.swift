@@ -8,11 +8,24 @@ struct SoundCloudAudioSource {
 
 /// A SoundCloud set opened for adding several tracks at once.
 struct SoundCloudCollection: Equatable {
+    enum Kind: Equatable { case set, artist, likes, related, subscriptions }
     let title: String
     let artist: String
     let url: URL
     let artwork: URL?
     var tracks: [SoundCloudTrack]
+    var kind = Kind.set
+    /// The account behind artist and likes lists, so it can be followed.
+    var userID: String?
+}
+
+/// What to open as a list of tracks.
+enum SoundCloudCollectionRequest: Equatable {
+    case set(URL)
+    /// A profile page lists the artist's tracks; its /likes page their likes.
+    case user(URL, likes: Bool)
+    case artist(userID: String, name: String)
+    case related(SoundCloudTrack)
 }
 
 /// A stream for listening in the app; `isClip` marks SoundCloud's 30-second preview of a restricted track.
@@ -407,6 +420,75 @@ final class SoundCloudSearchClient {
         throw SoundCloudError.message("Не удалось открыть сет SoundCloud. Попробуй позже.")
     }
 
+    /// One api-v2 call with the public identifier, renewed once when SoundCloud rotates it.
+    private func api(_ path: String, query: [URLQueryItem] = [], next: URL? = nil, cancellation: SoundCloudCancellation) throws -> Any {
+        for attempt in 0...1 {
+            let clientID = try credential(refresh: attempt > 0, cancellation: cancellation)
+            var components = next.flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false) }
+                ?? URLComponents(string: "https://api-v2.soundcloud.com/" + path)!
+            components.queryItems = (components.queryItems ?? []).filter { $0.name != "client_id" } + query
+                + [URLQueryItem(name: "client_id", value: clientID)]
+            guard let url = components.url, url.scheme == "https", url.host == "api-v2.soundcloud.com" else {
+                throw SoundCloudError.message("SoundCloud вернул недопустимый адрес.")
+            }
+            let (data, response) = try request(url, cancellation: cancellation)
+            if [401, 403].contains(response.statusCode), attempt == 0 { continue }
+            if response.statusCode == 429 { throw SoundCloudError.rateLimited }
+            guard response.statusCode == 200, data.count <= 20_000_000, let value = try? JSONSerialization.jsonObject(with: data) else {
+                throw SoundCloudError.message("SoundCloud не ответил на запрос (\(response.statusCode)).")
+            }
+            return value
+        }
+        throw SoundCloudError.message("Не удалось подключиться к SoundCloud. Попробуй позже.")
+    }
+
+    /// A profile or likes page: the account is resolved first, then its list is read.
+    func userCollection(_ link: URL, likes: Bool, cancellation: SoundCloudCancellation) throws -> SoundCloudCollection {
+        guard let user = try api("resolve", query: [URLQueryItem(name: "url", value: link.absoluteString)], cancellation: cancellation) as? [String: Any],
+              user["kind"] as? String == "user", let id = (user["id"] as? NSNumber)?.stringValue ?? user["id"] as? String else {
+            throw SoundCloudError.message("Это ссылка не на страницу автора SoundCloud.")
+        }
+        let name = (user["username"] as? String)?.nonEmpty ?? "SoundCloud"
+        return likes ? try likesCollection(userID: id, name: name, cancellation: cancellation)
+                     : try artistCollection(userID: id, name: name, cancellation: cancellation)
+    }
+
+    func artistCollection(userID: String, name: String, cancellation: SoundCloudCancellation) throws -> SoundCloudCollection {
+        guard userID.allSatisfy(\.isNumber) else { throw SoundCloudError.message("Неверный автор SoundCloud.") }
+        let root = try api("users/\(userID)/tracks", query: [URLQueryItem(name: "limit", value: "50")], cancellation: cancellation) as? [String: Any]
+        let tracks = try Self.tracks(root?["collection"] as? [[String: Any]] ?? [], limit: 50)
+        guard !tracks.isEmpty else { throw SoundCloudError.message("У \(name) нет доступных треков.") }
+        return SoundCloudCollection(title: "Треки \(name)", artist: name, url: tracks[0].url.deletingLastPathComponent(),
+                                    artwork: tracks.first?.artwork, tracks: tracks, kind: .artist, userID: userID)
+    }
+
+    /// Likes come in pages of tracks and sets; only tracks are kept, up to 500.
+    func likesCollection(userID: String, name: String, cancellation: SoundCloudCancellation) throws -> SoundCloudCollection {
+        guard userID.allSatisfy(\.isNumber) else { throw SoundCloudError.message("Неверный автор SoundCloud.") }
+        var items: [[String: Any]] = []
+        var next: URL?
+        repeat {
+            if cancellation.isCancelled { throw SoundCloudError.cancelled }
+            let page = try api("users/\(userID)/likes", query: next == nil ? [URLQueryItem(name: "limit", value: "200")] : [],
+                               next: next, cancellation: cancellation) as? [String: Any]
+            items += (page?["collection"] as? [[String: Any]] ?? []).compactMap { $0["track"] as? [String: Any] }
+            next = (page?["next_href"] as? String).flatMap(URL.init(string:))
+        } while next != nil && items.count < 500
+        let tracks = try Self.tracks(items, limit: 500)
+        guard !tracks.isEmpty else { throw SoundCloudError.message("У \(name) нет открытых лайков.") }
+        return SoundCloudCollection(title: "Лайки \(name)", artist: name, url: tracks[0].url.deletingLastPathComponent(),
+                                    artwork: tracks.first?.artwork, tracks: tracks, kind: .likes, userID: userID)
+    }
+
+    func related(_ track: SoundCloudTrack, cancellation: SoundCloudCancellation) throws -> SoundCloudCollection {
+        guard track.id.allSatisfy(\.isNumber) else { throw SoundCloudError.message("Для этого трека нет похожих.") }
+        let root = try api("tracks/\(track.id)/related", query: [URLQueryItem(name: "limit", value: "20")], cancellation: cancellation) as? [String: Any]
+        let tracks = try Self.tracks(root?["collection"] as? [[String: Any]] ?? [], limit: 20).filter { $0.id != track.id }
+        guard !tracks.isEmpty else { throw SoundCloudError.message("SoundCloud не нашёл похожих треков.") }
+        return SoundCloudCollection(title: "Похоже на «\(track.title)»", artist: track.artist, url: track.url,
+                                    artwork: track.artwork, tracks: tracks, kind: .related)
+    }
+
     /// Track objects from search, a set or a batch lookup, normalized the same way.
     static func tracks(_ items: [[String: Any]], limit: Int) throws -> [SoundCloudTrack] {
         let normalized: [[String: Any]] = items.prefix(limit).compactMap { item in
@@ -416,6 +498,7 @@ final class SoundCloudSearchClient {
             var track: [String: Any] = ["id": item["id"] ?? "", "title": item["title"] ?? "",
                                       "webpage_url": item["permalink_url"] ?? "",
                                       "uploader": user["username"] ?? "Автор не указан"]
+            track["uploader_id"] = (user["id"] as? NSNumber)?.stringValue ?? user["id"] as? String
             if let artist = publisher["artist"] as? String, !artist.isEmpty { track["artist"] = artist }
             if let milliseconds = item["duration"] as? Double { track["duration"] = milliseconds / 1000 }
             track["thumbnail"] = item["artwork_url"] as? String ?? user["avatar_url"] as? String

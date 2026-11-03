@@ -1226,6 +1226,182 @@ expect(handedOff.last?.0 == "set-2" && handedOff.last?.1 == nil, "without the se
 collectionModel.closeCollection()
 expect(collectionModel.collection == nil && collectionModel.results.isEmpty, "closing a set returns to search")
 
+// Artist pages, likes and related tracks open as lists too.
+expect(SoundCloudService.collectionRequest("https://soundcloud.com/artist/sets/album") == .set(URL(string: "https://soundcloud.com/artist/sets/album")!)
+       && SoundCloudService.collectionRequest("https://m.soundcloud.com/dj-name?ref=x") == .user(URL(string: "https://soundcloud.com/dj-name")!, likes: false)
+       && SoundCloudService.collectionRequest("https://soundcloud.com/dj-name/tracks") == .user(URL(string: "https://soundcloud.com/dj-name")!, likes: false)
+       && SoundCloudService.collectionRequest("https://soundcloud.com/dj-name/likes") == .user(URL(string: "https://soundcloud.com/dj-name")!, likes: true),
+       "profiles, their track pages and likes pages open as lists")
+expect(SoundCloudService.collectionRequest("https://soundcloud.com/dj-name/song") == nil
+       && SoundCloudService.collectionRequest("https://soundcloud.com/discover") == nil
+       && SoundCloudService.collectionRequest("https://soundcloud.com/search?q=x") == nil
+       && SoundCloudService.collectionRequest("https://soundcloud.com.evil.test/dj-name") == nil
+       && SoundCloudService.collectionRequest("dj-name") == nil, "track links, site pages and foreign hosts stay out")
+expect(LinkRoute.detect("https://soundcloud.com/dj-name/likes") == .soundCloud("https://soundcloud.com/dj-name/likes"),
+       "a likes page is routed to SoundCloud")
+func userTrack(_ id: Int, user: Int = 77) -> [String: Any] {
+    var item = setTrack(id, full: true)
+    item["user"] = ["username": "Диджей", "id": user]
+    return item
+}
+var listRequests: [URL] = []
+let listClient = SoundCloudSearchClient(cache: nativeCache, clientID: String(repeating: "b", count: 32)) { request, _ in
+    let url = request.url!
+    listRequests.append(url)
+    let query = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+    var body: Any = [:]
+    switch url.path {
+    case "/resolve":
+        let link = query.first { $0.name == "url" }?.value ?? ""
+        body = link.hasSuffix("/evil") ? ["kind": "user", "id": 88, "username": "Злой"] as [String: Any]
+                                       : ["kind": "user", "id": 77, "username": "Диджей"]
+    case "/users/77/likes":
+        body = query.contains { $0.name == "cursor" }
+            ? ["collection": [["track": userTrack(11, user: 5)]]] as [String: Any]
+            : ["collection": [["track": userTrack(10, user: 5)], ["playlist": ["id": 1]]],
+               "next_href": "https://api-v2.soundcloud.com/users/77/likes?cursor=2&limit=200"]
+    case "/users/88/likes":
+        body = ["collection": [["track": userTrack(12)]], "next_href": "https://evil.test/users/88/likes?cursor=2"]
+    case "/users/77/tracks":
+        body = ["collection": [userTrack(20), userTrack(21)]]
+    case "/tracks/10/related":
+        body = ["collection": [userTrack(10), userTrack(30)]]
+    default:
+        return (Data(), HTTPURLResponse(url: url, statusCode: 404, httpVersion: nil, headerFields: nil)!)
+    }
+    return (try JSONSerialization.data(withJSONObject: body), HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+}
+let likes = try listClient.userCollection(URL(string: "https://soundcloud.com/dj-name")!, likes: true, cancellation: SoundCloudCancellation())
+expect(likes.tracks.map(\.id) == ["10", "11"] && likes.kind == .likes && likes.title == "Лайки Диджей" && likes.userID == "77",
+       "likes follow every page and keep only tracks")
+expect(listRequests.filter { $0.path == "/users/77/likes" }.count == 2
+       && listRequests.allSatisfy { url in URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.filter { $0.name == "client_id" }.count == 1 },
+       "the next page is asked for once, with a single client ID")
+expect((try? listClient.userCollection(URL(string: "https://soundcloud.com/evil")!, likes: true, cancellation: SoundCloudCancellation())) == nil,
+       "a next page on another host is refused")
+let artistList = try listClient.artistCollection(userID: "77", name: "Диджей", cancellation: SoundCloudCancellation())
+expect(artistList.tracks.map(\.id) == ["20", "21"] && artistList.kind == .artist && artistList.tracks.allSatisfy { $0.userID == "77" },
+       "an artist list carries the uploader's account on every track")
+let relatedList = try listClient.related(likes.tracks[0], cancellation: SoundCloudCancellation())
+expect(relatedList.tracks.map(\.id) == ["30"] && relatedList.kind == .related, "related tracks leave out the track itself")
+expect((try? listClient.artistCollection(userID: "77/../me", name: "x", cancellation: SoundCloudCancellation())) == nil,
+       "an account must be a number")
+
+final class BrowseFixture: SoundCloudProviding {
+    func search(_ input: String, cancellation: SoundCloudCancellation) throws -> [SoundCloudTrack] {
+        [SoundCloudTrack(id: "hit", title: "Хит", artist: "Певица", url: URL(string: "https://soundcloud.com/singer/hit")!, userID: "9")]
+    }
+    func download(_ track: SoundCloudTrack, directory: URL, cancellation: SoundCloudCancellation, stage: @escaping (String) -> Void) throws -> URL {
+        directory.appendingPathComponent(track.id + ".m4a")
+    }
+    func collection(_ request: SoundCloudCollectionRequest, cancellation: SoundCloudCancellation) throws -> SoundCloudCollection {
+        let make: (String) -> SoundCloudTrack = {
+            SoundCloudTrack(id: $0, title: $0, artist: "Певица", url: URL(string: "https://soundcloud.com/singer/\($0)")!, userID: "9")
+        }
+        switch request {
+        case .related: return SoundCloudCollection(title: "Похоже", artist: "", url: URL(string: "https://soundcloud.com/singer/hit")!,
+                                                   artwork: nil, tracks: [make("r1"), make("r2")], kind: .related)
+        case .artist(let id, let name): return SoundCloudCollection(title: "Треки \(name)", artist: name, url: URL(string: "https://soundcloud.com/singer")!,
+                                                                    artwork: nil, tracks: [make("a1")], kind: .artist, userID: id)
+        default: throw SoundCloudError.message("нет")
+        }
+    }
+}
+let browse = SoundCloudStore(service: BrowseFixture(), directory: root.appendingPathComponent("Browse"))
+browse.query = "хит"; browse.search()
+waitUI { !browse.isSearching }
+browse.openRelated(browse.results[0])
+waitUI { !browse.isSearching }
+expect(browse.collection?.kind == .related && browse.selection.isEmpty && !browse.collectionIntoPlaylist && browse.canGoBack,
+       "related tracks open with nothing selected and no playlist")
+browse.openArtist(browse.results[0])
+waitUI { !browse.isSearching }
+expect(browse.collection?.kind == .artist && browse.collection?.userID == "9" && browse.results.map(\.id) == ["a1"],
+       "an artist list opens from a row of another list")
+browse.closeCollection()
+expect(browse.collection?.kind == .related && browse.results.map(\.id) == ["r1", "r2"], "closing goes back to the previous list")
+browse.closeCollection()
+expect(browse.collection == nil && browse.results.map(\.id) == ["hit"] && !browse.canGoBack, "and then back to the search results")
+
+// Subscriptions: what an artist had when followed is known; later uploads are offered once.
+let subscriptionDefaults = UserDefaults(suiteName: "musicdrop-subscriptions-" + UUID().uuidString)!
+var uploads: [String: [String]] = ["9": ["a1"]]
+var subscriptionNow = Date()
+var failArtist = false
+let subscriptionFetch: SubscriptionStore.Fetch = { id, name, _ in
+    if failArtist { throw SoundCloudError.message("нет связи") }
+    let ids = DispatchQueue.main.sync { uploads[id] ?? [] }
+    return SoundCloudCollection(title: name, artist: name, url: URL(string: "https://soundcloud.com/singer")!, artwork: nil,
+                                tracks: ids.map { SoundCloudTrack(id: $0, title: $0, artist: name, url: URL(string: "https://soundcloud.com/singer/\($0)")!, userID: id) },
+                                kind: .artist, userID: id)
+}
+let subscriptionStore = SubscriptionStore(fetch: subscriptionFetch, defaults: subscriptionDefaults, now: { subscriptionNow })
+var announced: [[String]] = []
+subscriptionStore.onNew = { announced.append($0.map(\.id)) }
+subscriptionStore.follow(relatedList)
+expect(subscriptionStore.subscriptions.isEmpty, "only artist lists can be followed")
+subscriptionStore.follow(SoundCloudCollection(title: "Треки Певица", artist: "Певица", url: URL(string: "https://soundcloud.com/singer")!,
+                                              artwork: nil, tracks: [SoundCloudTrack(id: "a1", title: "a1", artist: "Певица", url: URL(string: "https://soundcloud.com/singer/a1")!)],
+                                              kind: .artist, userID: "9"))
+expect(subscriptionStore.subscriptions.map(\.userID) == ["9"] && subscriptionStore.subscriptions[0].seen == ["a1"] && subscriptionStore.isFollowing("9"),
+       "following an artist marks their current tracks as seen")
+var checked = false
+subscriptionStore.check { checked = true }
+waitUI { checked }
+expect(subscriptionStore.fresh.isEmpty && announced.isEmpty, "nothing is new right after following")
+uploads["9"] = ["a2", "a1"]
+checked = false
+subscriptionStore.checkIfDue()
+subscriptionNow = subscriptionNow.addingTimeInterval(7 * 3_600)
+subscriptionStore.check { checked = true }
+waitUI { checked }
+expect(subscriptionStore.fresh.map(\.id) == ["a2"] && announced == [["a2"]] && subscriptionStore.subscriptions[0].seen.prefix(2) == ["a2", "a1"],
+       "a new upload is collected and announced once")
+checked = false
+subscriptionStore.check { checked = true }
+waitUI { checked }
+expect(subscriptionStore.fresh.map(\.id) == ["a2"] && announced.count == 1, "a second check does not offer it again")
+let reloaded = SubscriptionStore(fetch: subscriptionFetch, defaults: subscriptionDefaults)
+expect(reloaded.subscriptions.map(\.userID) == ["9"] && reloaded.fresh.map(\.id) == ["a2"] && reloaded.freshCollection?.kind == .subscriptions,
+       "subscriptions and new tracks survive a restart")
+failArtist = true
+checked = false
+subscriptionStore.check { checked = true }
+waitUI { checked }
+expect(subscriptionStore.lastError != nil && subscriptionStore.fresh.count == 1, "a failed check keeps what was found")
+failArtist = false
+subscriptionStore.unfollow("9")
+expect(subscriptionStore.subscriptions.isEmpty && subscriptionStore.fresh.isEmpty, "unfollowing drops the artist and their new tracks")
+
+// A watched folder imports MP3s once they stop changing.
+let watched = root.appendingPathComponent("Watched", isDirectory: true)
+try FileManager.default.createDirectory(at: watched, withIntermediateDirectories: true)
+let watchDefaults = UserDefaults(suiteName: "musicdrop-watch-" + UUID().uuidString)!
+watchDefaults.set(Date().addingTimeInterval(-60), forKey: FolderWatcher.sinceKey)
+try Data(repeating: 1, count: 10).write(to: watched.appendingPathComponent("old.mp3"))
+try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-3_600)], ofItemAtPath: watched.appendingPathComponent("old.mp3").path)
+try Data(repeating: 1, count: 10).write(to: watched.appendingPathComponent("while-closed.mp3"))
+var delivered: [String] = []
+let watcher = FolderWatcher(folder: watched, defaults: watchDefaults) { delivered += $0.map(\.lastPathComponent) }
+watcher.prime()
+watcher.poll()
+expect(delivered == ["while-closed.mp3"], "a file that arrived while the app was closed is imported; older ones are not")
+try Data(repeating: 1, count: 10).write(to: watched.appendingPathComponent("growing.mp3"))
+try Data().write(to: watched.appendingPathComponent("empty.mp3"))
+for name in ["song.mp3.crdownload", ".hidden.mp3", "notes.txt"] { try Data(repeating: 1, count: 10).write(to: watched.appendingPathComponent(name)) }
+watcher.poll()
+let growing = try FileHandle(forWritingTo: watched.appendingPathComponent("growing.mp3")); try growing.seekToEnd(); try growing.write(contentsOf: Data(repeating: 2, count: 10)); try growing.close()
+try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(5)], ofItemAtPath: watched.appendingPathComponent("growing.mp3").path)
+watcher.poll()
+expect(delivered == ["while-closed.mp3"], "a file still being written waits")
+watcher.poll()
+expect(delivered == ["while-closed.mp3", "growing.mp3"], "it is imported once two looks agree, and unfinished, hidden, empty and other files never are")
+watcher.poll()
+expect(delivered.count == 2, "each file is imported once")
+expect(!FolderWatcher.isAllowed(root, storage: root) && !FolderWatcher.isAllowed(root.appendingPathComponent("Downloads"), storage: root)
+       && !FolderWatcher.isAllowed(URL(fileURLWithPath: "/"), storage: root) && FolderWatcher.isAllowed(watched, storage: root.appendingPathComponent("Library")),
+       "Music Drop's own folders cannot be watched")
+
 final class PreviewFixture: SoundCloudProviding {
     let lock = NSLock()
     var calls: [String] = []
@@ -1931,8 +2107,9 @@ expect(LinkRoute.detect("https://youtu.be/\(ytID)?si=share") == .youTube("https:
 expect(LinkRoute.detect("тёмный принц") == nil && LinkRoute.forInput("тёмный принц") == .soundCloud("тёмный принц"),
        "plain words are not treated as links but a search field sends them to SoundCloud")
 expect(LinkRoute.detect("https://example.com/song") == nil && LinkRoute.forInput("https://youtube.com/watch?list=WL") == nil
-       && LinkRoute.detect("https://soundcloud.com/artist") == nil,
-       "foreign sites, private lists and profile pages are never routed")
+       && LinkRoute.detect("https://soundcloud.com/discover") == nil
+       && LinkRoute.detect("https://soundcloud.com/artist") == .soundCloud("https://soundcloud.com/artist"),
+       "foreign sites, private lists and site pages are never routed; a profile opens its tracks")
 expect(LinkRoute.detect("https://www.youtube.com/playlist?list=PL1234") == .youTube("https://www.youtube.com/playlist?list=PL1234")
        && LinkRoute.detect("https://soundcloud.com/artist/sets/album") == .soundCloud("https://soundcloud.com/artist/sets/album"),
        "YouTube playlists and SoundCloud sets open in their tabs")

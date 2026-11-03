@@ -56,7 +56,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
     var soundCloud: SoundCloudStore!
     var youtube: YouTubeStore!
     var navigation: PanelNavigation!
+    var subscriptions: SubscriptionStore!
     let previewPlayer = PreviewPlayer()
+    private var folderWatcher: FolderWatcher?
+    private var subscriptionTimer: Timer?
     private var wasDownloading = false
     private var hotKey: HotKey?
     var previewWindow: NSWindow?
@@ -71,6 +74,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         soundCloud = SoundCloudStore(preview: preview)
         youtube = YouTubeStore(preview: preview)
         navigation = PanelNavigation(soundCloud: soundCloud, youtube: youtube)
+        let soundCloudStore = soundCloud!
+        subscriptions = SubscriptionStore(fetch: { id, name, token in
+            try soundCloudStore.artistCollection(userID: id, name: name, cancellation: token)
+        })
+        subscriptions.onNew = { tracks in
+            let artists = Set(tracks.map(\.artist)).sorted()
+            Notifier.shared.post(title: "Новое от подписок: \(CollectionHeader.tracks(tracks.count))",
+                                 body: artists.prefix(3).joined(separator: ", ") + (artists.count > 3 ? " и другие" : ""))
+        }
         soundCloud.onPreview = { [weak self] url in
             if let url { self?.previewPlayer.play(url) } else { self?.previewPlayer.stop() }
         }
@@ -127,6 +139,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         }
         // YouTube changes often outpace app releases; a newer yt-dlp is fetched in the background.
         if !preview { ExtractorUpdater.shared.checkIfDue() }
+        if !preview {
+            configureFolderWatcher()
+            // New uploads are looked for a little after launch and then a few times a day.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in self?.subscriptions.checkIfDue() }
+            subscriptionTimer = Timer.scheduledTimer(withTimeInterval: 3_600, repeats: true) { [weak self] _ in
+                self?.subscriptions.checkIfDue()
+            }
+        }
         showWindow()
         if !preview { UserDefaults.standard.set(true, forKey: "didShowWelcome") }
     }
@@ -239,7 +259,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         if popover.contentViewController == nil {
             popover.contentSize = NSSize(width: 380, height: 540)
             popover.contentViewController = NSHostingController(rootView: DropPanel(store: store, soundCloud: soundCloud, youtube: youtube,
-                                                                                   navigation: navigation, player: previewPlayer))
+                                                                                   navigation: navigation, player: previewPlayer,
+                                                                                   subscriptions: subscriptions))
         }
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         if activate { popover.contentViewController?.view.window?.makeKeyAndOrderFront(nil) }
@@ -274,7 +295,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         window.titlebarAppearsTransparent = true
         window.isMovableByWindowBackground = true
         window.contentView = NSHostingView(rootView: DropPanel(store: store, soundCloud: soundCloud, youtube: youtube,
-                                                               navigation: navigation, player: previewPlayer).padding(.top, 24))
+                                                               navigation: navigation, player: previewPlayer,
+                                                               subscriptions: subscriptions).padding(.top, 24))
         window.delegate = self
         window.setContentSize(NSSize(width: 380, height: 564))
         window.isReleasedWhenClosed = false
@@ -301,8 +323,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
     private func opensCollection(_ route: LinkRoute) -> Bool {
         switch route {
         case .youTube(let link): return YouTubeService.isPlaylistLink(link)
-        case .soundCloud(let link): return SoundCloudService.collectionTarget(link) != nil
+        case .soundCloud(let link): return SoundCloudService.collectionRequest(link) != nil
         }
+    }
+
+    /// Follows the folder chosen in settings; called again whenever it changes.
+    func configureFolderWatcher() {
+        folderWatcher?.stop()
+        folderWatcher = nil
+        guard let folder = FolderWatcher.savedFolder, FolderWatcher.isAllowed(folder, storage: store.directory) else { return }
+        let watcher = FolderWatcher(folder: folder) { [weak self] files in
+            DispatchQueue.main.async { self?.store.accept(files) }
+        }
+        watcher.start()
+        folderWatcher = watcher
     }
 
     func configureHotKey() {

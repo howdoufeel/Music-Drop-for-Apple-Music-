@@ -21,6 +21,8 @@ struct SoundCloudTrack: Identifiable, Equatable {
     var year: Int?
     /// The release a track belongs to, when SoundCloud names one.
     var album: String?
+    /// The uploader's account, for their other tracks and for following them.
+    var userID: String?
 
     var durationLabel: String {
         guard let duration, duration.isFinite, duration >= 0 else { return "" }
@@ -74,11 +76,17 @@ protocol SoundCloudProviding {
     func previewStream(for track: SoundCloudTrack, cancellation: SoundCloudCancellation) throws -> SoundCloudPreview?
     /// The tracks of a set link accepted by `collectionTarget`.
     func collection(_ link: URL, cancellation: SoundCloudCancellation) throws -> SoundCloudCollection
+    /// Any list of tracks: a set, an artist, their likes or tracks like another.
+    func collection(_ request: SoundCloudCollectionRequest, cancellation: SoundCloudCancellation) throws -> SoundCloudCollection
 }
 
 extension SoundCloudProviding {
     func collection(_ link: URL, cancellation: SoundCloudCancellation) throws -> SoundCloudCollection {
         throw SoundCloudError.message("Сеты SoundCloud здесь не поддерживаются.")
+    }
+    func collection(_ request: SoundCloudCollectionRequest, cancellation: SoundCloudCancellation) throws -> SoundCloudCollection {
+        guard case .set(let link) = request else { throw SoundCloudError.message("Этот список SoundCloud здесь не поддерживается.") }
+        return try collection(link, cancellation: cancellation)
     }
     func previewStream(for track: SoundCloudTrack, cancellation: SoundCloudCancellation) throws -> SoundCloudPreview? { nil }
     func download(_ track: SoundCloudTrack, directory: URL, cancellation: SoundCloudCancellation,
@@ -175,7 +183,9 @@ final class SoundCloudService: SoundCloudProviding {
                                    url: url, duration: item["duration"] as? Double, artwork: artwork,
                                    genre: (item["genre"] as? String).map { cleaned($0, maximum: 100) }?.nonEmpty,
                                    year: TrackMetadata.year(item["release_year"]),
-                                   album: (item["album"] as? String).map { cleaned($0, maximum: 300) }?.nonEmpty)
+                                   album: (item["album"] as? String).map { cleaned($0, maximum: 300) }?.nonEmpty,
+                                   userID: ((item["uploader_id"] as? String) ?? (item["uploader_id"] as? NSNumber)?.stringValue)
+                                       .flatMap { $0.allSatisfy(\.isNumber) ? $0 : nil })
         }
     }
 
@@ -209,6 +219,34 @@ final class SoundCloudService: SoundCloudProviding {
 
     func collection(_ link: URL, cancellation: SoundCloudCancellation) throws -> SoundCloudCollection {
         try searchClient.collection(link, cancellation: cancellation)
+    }
+
+    func collection(_ request: SoundCloudCollectionRequest, cancellation: SoundCloudCancellation) throws -> SoundCloudCollection {
+        switch request {
+        case .set(let link): return try searchClient.collection(link, cancellation: cancellation)
+        case .user(let link, let likes): return try searchClient.userCollection(link, likes: likes, cancellation: cancellation)
+        case .artist(let userID, let name): return try searchClient.artistCollection(userID: userID, name: name, cancellation: cancellation)
+        case .related(let track): return try searchClient.related(track, cancellation: cancellation)
+        }
+    }
+
+    /// Sets, profiles and likes pages open as lists; a profile's /tracks page counts as the profile.
+    static func collectionRequest(_ input: String) -> SoundCloudCollectionRequest? {
+        if let set = collectionTarget(input) { return .set(set) }
+        let value = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard value.count <= 2_000, !value.contains("\0"), var components = URLComponents(string: value),
+              ["https", "http"].contains(components.scheme?.lowercased() ?? ""),
+              ["soundcloud.com", "www.soundcloud.com", "m.soundcloud.com"].contains(components.host?.lowercased() ?? ""),
+              components.user == nil, components.password == nil, components.port == nil || components.port == 443 else { return nil }
+        let path = components.path.split(separator: "/").map(String.init)
+        let reserved: Set<String> = ["search", "discover", "stream", "you", "upload", "charts", "feed", "settings",
+                                     "messages", "notifications", "pages", "mobile", "terms-of-use", "jobs", "people"]
+        guard let user = path.first, !reserved.contains(user.lowercased()),
+              path.count == 1 || (path.count == 2 && ["likes", "tracks", "popular-tracks"].contains(path[1])) else { return nil }
+        components.scheme = "https"; components.host = "soundcloud.com"
+        components.path = "/" + user; components.query = nil; components.fragment = nil
+        guard let profile = components.url else { return nil }
+        return .user(profile, likes: path.count == 2 && path[1] == "likes")
     }
 
     /// A set or album link: soundcloud.com/<artist>/sets/<name>. Anything else returns nil.

@@ -6,6 +6,7 @@ struct SoundCloudPanel: View {
     var imports: ImportStore
     var navigation: PanelNavigation
     var player: PreviewPlayer
+    var subscriptions: SubscriptionStore
     @FocusState private var searchFocused: Bool
 
     var body: some View {
@@ -42,6 +43,9 @@ struct SoundCloudPanel: View {
             }
             ScrollView {
                 LazyVStack(spacing: 0) {
+                    if model.collection == nil, let fresh = subscriptions.freshCollection {
+                        freshBanner(fresh).padding(.bottom, 10)
+                    }
                     if let collection = model.collection {
                         collectionHeader(collection).padding(.bottom, 8)
                         ForEach(collection.tracks) { track in
@@ -95,11 +99,39 @@ struct SoundCloudPanel: View {
                                 symbol: "square.stack", tint: .orange, total: collection.tracks.count,
                                 selected: model.selection.intersection(collection.tracks.map(\.id)).count,
                                 added: added, inFlight: importing + downloading, intoPlaylist: $model.collectionIntoPlaylist,
+                                goesBack: model.canGoBack,
+                                secondary: followAction(collection),
                                 selectAll: { model.selection = Set(collection.tracks.filter { imports.entry(soundCloudID: $0.id)?.stage != .imported }.map(\.id)) },
                                 selectNone: { model.selection = [] },
                                 add: { addCollection(collection) },
-                                close: { model.closeCollection() })
+                                close: {
+                                    if collection.kind == .subscriptions { subscriptions.clearFresh() }
+                                    model.closeCollection()
+                                })
         .onAppear { model.selection.subtract(collection.tracks.filter { imports.entry(soundCloudID: $0.id)?.stage == .imported }.map(\.id)) }
+    }
+
+    private func followAction(_ collection: SoundCloudCollection) -> (title: String, symbol: String, action: () -> Void)? {
+        guard collection.kind == .artist, let userID = collection.userID else { return nil }
+        return subscriptions.isFollowing(userID)
+            ? ("Вы подписаны", "bell.fill", { subscriptions.unfollow(userID) })
+            : ("Подписаться", "bell", { subscriptions.follow(collection) })
+    }
+
+    private func freshBanner(_ fresh: SoundCloudCollection) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: "bell.badge").foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Новое от подписок: \(CollectionHeader.tracks(fresh.tracks.count))").font(.system(size: 12, weight: .semibold))
+                Text(fresh.artist).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
+            }
+            Spacer(minLength: 0)
+            Button("Открыть") { model.show(fresh) }.controlSize(.small).buttonStyle(.borderedProminent).tint(.orange)
+            Button { subscriptions.clearFresh() } label: { Image(systemName: "xmark") }
+                .buttonStyle(.borderless).foregroundStyle(.secondary).help("Скрыть").accessibilityLabel("Скрыть новые треки")
+        }
+        .padding(10)
+        .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
     }
 
     /// Tracks already in the library are not downloaded again but still join the set's playlist.
@@ -215,8 +247,19 @@ struct SoundCloudPanel: View {
             }
             HStack {
                 Spacer()
-                Button("Открыть на SoundCloud") { NSWorkspace.shared.open(track.url) }
-                    .buttonStyle(.borderless).font(.system(size: 10)).foregroundStyle(.secondary)
+                Menu {
+                    Button("Похожие треки") { model.openRelated(track) }
+                    if track.userID != nil {
+                        Button("Ещё от \(track.artist)") { model.openArtist(track) }
+                    }
+                    Divider()
+                    Button("Открыть на SoundCloud") { NSWorkspace.shared.open(track.url) }
+                } label: {
+                    Text("Ещё…").font(.system(size: 10))
+                }
+                .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+                .foregroundStyle(.secondary)
+                .accessibilityLabel("Ещё действия для \(track.title)")
             }
         }.padding(.vertical, 12)
     }

@@ -70,6 +70,10 @@ struct CollectionHeader: View {
     let inFlight: Int
     @Binding var intoPlaylist: Bool
     var allowsPlaylist = true
+    /// Closing returns to the list this one was opened from.
+    var goesBack = false
+    /// An extra action beside the selection buttons, such as following the artist.
+    var secondary: (title: String, symbol: String, action: () -> Void)?
     let selectAll: () -> Void
     let selectNone: () -> Void
     let add: () -> Void
@@ -85,9 +89,9 @@ struct CollectionHeader: View {
                     Text(summary).font(.system(size: 10)).foregroundStyle(.secondary)
                 }
                 Spacer(minLength: 0)
-                Button(action: close) { Image(systemName: "xmark.circle.fill") }
+                Button(action: close) { Image(systemName: goesBack ? "chevron.backward.circle.fill" : "xmark.circle.fill") }
                     .buttonStyle(.borderless).foregroundStyle(.secondary)
-                    .help("Закрыть").accessibilityLabel("Закрыть «\(title)»")
+                    .help(goesBack ? "Назад" : "Закрыть").accessibilityLabel(goesBack ? "Назад" : "Закрыть «\(title)»")
             }
             if allowsPlaylist {
                 Toggle("Добавить в плейлист «\(title)»", isOn: $intoPlaylist).toggleStyle(.checkbox).font(.system(size: 11))
@@ -95,6 +99,10 @@ struct CollectionHeader: View {
             HStack(spacing: 12) {
                 Button("Выбрать все", action: selectAll).buttonStyle(.borderless).disabled(selected == total)
                 Button("Снять все", action: selectNone).buttonStyle(.borderless).disabled(selected == 0)
+                if let secondary {
+                    Button(action: secondary.action) { Label(secondary.title, systemImage: secondary.symbol) }
+                        .buttonStyle(.borderless)
+                }
                 Spacer()
                 Button(action: add) { Text(selected == 0 ? "Ничего не выбрано" : "Добавить \(selected)") }
                     .buttonStyle(.borderedProminent).tint(tint).disabled(selected == 0)
@@ -126,6 +134,7 @@ struct DropPanel: View {
     var youtube: YouTubeStore
     @Bindable var navigation: PanelNavigation
     var player: PreviewPlayer
+    var subscriptions: SubscriptionStore
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @AppStorage(YouTubeAudioFormat.defaultsKey) private var youtubeFormat: YouTubeAudioFormat = .m4a
     @AppStorage(YouTubeFallbackRace.defaultsKey) private var raceFallback = true
@@ -133,6 +142,7 @@ struct DropPanel: View {
     @State private var extractor = ExtractorUpdateModel()
     @State private var notificationsOn = Notifier.shared.enabled
     @State private var hotKeyOn = HotKey.enabled
+    @State private var watchedFolder = FolderWatcher.savedFolder
     @State private var historyQuery = ""
     @State private var historyFilter = HistoryFilter.all
     @State private var historyLimit = 100
@@ -152,7 +162,7 @@ struct DropPanel: View {
             if navigation.tab == .youTube {
                 YouTubePanel(model: youtube, imports: store, navigation: navigation)
             } else if navigation.tab == .soundCloud {
-                SoundCloudPanel(model: soundCloud, imports: store, navigation: navigation, player: player)
+                SoundCloudPanel(model: soundCloud, imports: store, navigation: navigation, player: player, subscriptions: subscriptions)
             } else {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
@@ -368,6 +378,8 @@ struct DropPanel: View {
                 (NSApp.delegate as? AppDelegate)?.configureHotKey()
             }))
             .toggleStyle(.switch).controlSize(.small).font(.system(size: 12))
+            watchedFolderSettings
+            if !subscriptions.subscriptions.isEmpty { subscriptionSettings }
             VStack(alignment: .leading, spacing: 6) {
                 HStack {
                     Text("Компонент YouTube: yt-dlp " + (extractor.version ?? "—")).font(.system(size: 12))
@@ -408,6 +420,68 @@ struct DropPanel: View {
         }
         .padding(13)
         .background(Color(nsColor: .controlBackgroundColor).opacity(0.5), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private var watchedFolderSettings: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 8) {
+                Text(watchedFolder.map { "Папка: \($0.lastPathComponent)" } ?? "Следить за папкой").font(.system(size: 12)).lineLimit(1)
+                Spacer()
+                Button(watchedFolder == nil ? "Выбрать…" : "Другая…", action: chooseWatchedFolder)
+                if watchedFolder != nil {
+                    Button("Выключить") { setWatchedFolder(nil) }
+                }
+            }
+            .buttonStyle(.borderless).font(.system(size: 11))
+            Text(watchedFolder == nil ? "Новые MP3, например в «Загрузках», будут добавляться сами."
+                                      : "Новые MP3 из этой папки добавляются сами, когда файл докачан.")
+                .font(.system(size: 10)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func chooseWatchedFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Следить"
+        panel.message = "Новые MP3 из этой папки будут добавляться в «Музыку»."
+        panel.directoryURL = watchedFolder ?? FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
+        guard panel.runModal() == .OK, let folder = panel.url else { return }
+        guard FolderWatcher.isAllowed(folder, storage: store.directory) else {
+            store.notice = "Эту папку Music Drop использует сам. Выбери другую."
+            return
+        }
+        setWatchedFolder(folder)
+    }
+
+    private func setWatchedFolder(_ folder: URL?) {
+        FolderWatcher.savedFolder = folder
+        watchedFolder = folder
+        (NSApp.delegate as? AppDelegate)?.configureFolderWatcher()
+    }
+
+    private var subscriptionSettings: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack {
+                Text("Подписки SoundCloud: \(subscriptions.subscriptions.count)").font(.system(size: 12))
+                Spacer()
+                if subscriptions.checking { ProgressView().controlSize(.mini) }
+                Button("Проверить") { subscriptions.check() }.disabled(subscriptions.checking)
+                    .buttonStyle(.borderless).font(.system(size: 11))
+            }
+            ForEach(subscriptions.subscriptions) { subscription in
+                HStack {
+                    Text(subscription.name).font(.system(size: 11)).lineLimit(1)
+                    Spacer()
+                    Button("Отписаться") { subscriptions.unfollow(subscription.userID) }
+                        .buttonStyle(.borderless).font(.system(size: 10))
+                }
+            }
+            if let error = subscriptions.lastError {
+                Text(error).font(.system(size: 10)).foregroundStyle(.secondary)
+            }
+        }
     }
 
     private var footer: some View {

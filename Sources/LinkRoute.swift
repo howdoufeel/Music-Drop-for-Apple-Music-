@@ -10,7 +10,7 @@ enum LinkRoute: Equatable {
         let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty, value.count <= 2_000, !value.contains("\n") else { return nil }
         if (try? YouTubeService.videoID(value)) != nil || YouTubeService.isPlaylistLink(value) { return .youTube(value) }
-        if value.contains("://"), (try? SoundCloudService.searchTarget(value)) != nil || SoundCloudService.collectionTarget(value) != nil {
+        if value.contains("://"), (try? SoundCloudService.searchTarget(value)) != nil || SoundCloudService.collectionRequest(value) != nil {
             return .soundCloud(value)
         }
         return nil

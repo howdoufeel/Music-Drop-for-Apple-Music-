@@ -22,6 +22,15 @@ import Observation
     /// Put the set's tracks into a playlist named after it.
     var collectionIntoPlaylist = true
     @ObservationIgnored private var playlistTargets: [String: String] = [:]
+    /// What was on screen before a related or artist list opened from it; closing goes back there.
+    private struct Screen {
+        let collection: SoundCloudCollection?
+        let results: [SoundCloudTrack]
+        let selection: Set<String>
+        let intoPlaylist: Bool
+    }
+    private var backStack: [Screen] = []
+    var canGoBack: Bool { !backStack.isEmpty }
     @ObservationIgnored private var autoAddInput: String?
     private let service: SoundCloudProviding
     private let searchQueue = DispatchQueue(label: "tech.musicdrop.soundcloud.search", qos: .userInitiated, attributes: .concurrent)
@@ -56,8 +65,9 @@ import Observation
         let input = query.trimmingCharacters(in: .whitespacesAndNewlines)
         autoAddInput = autoAdd && input.contains("://") ? input : nil
         if isSearching, activeSearchInput == input { return }
-        if let link = SoundCloudService.collectionTarget(input) { openCollection(link, input: input); return }
+        if let request = SoundCloudService.collectionRequest(input) { openCollection(request, input: input); return }
         collection = nil
+        backStack = []
         searchToken?.cancel()
         activeSearchInput = input
         let token = SoundCloudCancellation()
@@ -96,7 +106,47 @@ import Observation
         }
     }
 
-    private func openCollection(_ link: URL, input: String) {
+    /// An artist's latest uploads through the same connection the panel uses; blocks, call it off the main thread.
+    func artistCollection(userID: String, name: String, cancellation: SoundCloudCancellation) throws -> SoundCloudCollection {
+        try service.collection(.artist(userID: userID, name: name), cancellation: cancellation)
+    }
+
+    /// Tracks like this one, as a list to pick from.
+    func openRelated(_ track: SoundCloudTrack) {
+        openCollection(.related(track), input: nil)
+    }
+
+    /// The uploader's other tracks.
+    func openArtist(_ track: SoundCloudTrack) {
+        guard let id = track.userID else { return }
+        openCollection(.artist(userID: id, name: track.artist), input: nil)
+    }
+
+    /// A list that was fetched elsewhere, such as new tracks from followed artists.
+    func show(_ collection: SoundCloudCollection) {
+        backStack = []
+        searchToken?.cancel()
+        searchToken = nil
+        activeSearchInput = nil
+        isSearching = false
+        didSearch = true
+        error = nil
+        present(collection)
+    }
+
+    private func present(_ collection: SoundCloudCollection) {
+        self.collection = collection
+        results = collection.tracks
+        // A set or likes list is usually wanted whole; artist and related lists are picked from.
+        let whole = collection.kind == .set || collection.kind == .likes || collection.kind == .subscriptions
+        selection = whole ? Set(collection.tracks.map(\.id)) : []
+        collectionIntoPlaylist = collection.kind == .set || collection.kind == .likes
+        stopPreviewIfUnlisted()
+    }
+
+    /// A typed link starts over; a list opened from a row (no input) can be closed back to that row.
+    func openCollection(_ request: SoundCloudCollectionRequest, input: String?) {
+        if input != nil { backStack = [] }
         searchToken?.cancel()
         activeSearchInput = input
         let token = SoundCloudCancellation()
@@ -106,27 +156,39 @@ import Observation
         didSearch = true
         searchQueue.async { [weak self] in
             guard let self else { return }
-            let result = Result { try self.service.collection(link, cancellation: token) }
+            let result = Result { try self.service.collection(request, cancellation: token) }
             DispatchQueue.main.async {
                 guard self.searchToken === token else { return }
                 self.isSearching = false
                 switch result {
                 case .success(let collection):
-                    self.collection = collection
-                    self.results = collection.tracks
-                    self.selection = Set(collection.tracks.map(\.id))
+                    if input == nil, self.collection != nil || !self.results.isEmpty {
+                        self.backStack.append(Screen(collection: self.collection, results: self.results,
+                                                     selection: self.selection, intoPlaylist: self.collectionIntoPlaylist))
+                        if self.backStack.count > 20 { self.backStack.removeFirst() }
+                    }
+                    self.present(collection)
                 case .failure(let error):
                     if !token.isCancelled { self.error = error.localizedDescription }
+                    self.stopPreviewIfUnlisted()
                 }
-                self.stopPreviewIfUnlisted()
             }
         }
     }
 
     func closeCollection() {
-        collection = nil
-        selection = []
-        results = []
+        searchToken?.cancel()
+        isSearching = false
+        if let previous = backStack.popLast() {
+            collection = previous.collection
+            results = previous.results
+            selection = previous.selection
+            collectionIntoPlaylist = previous.intoPlaylist
+        } else {
+            collection = nil
+            selection = []
+            results = []
+        }
         stopPreviewIfUnlisted()
     }
 
