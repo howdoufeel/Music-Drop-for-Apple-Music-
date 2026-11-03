@@ -35,6 +35,16 @@ enum TrackMetadata {
         return value
     }
 
+    private static let chapterPrefix = try! NSRegularExpression(pattern:
+        #"^\s*(?:[\[\(]?\d{1,2}:\d{2}(?::\d{2})?[\]\)]?\s*(?:[-–—|:.]\s*)?|\d{1,3}\s*[\.\)]\s+|\d{1,3}\s+[-–—]\s+)"#)
+
+    /// Chapter names often repeat their number or time: "01. Song", "03:15 - Song", "[1:02:03] Song".
+    static func chapterTitle(_ raw: String) -> String {
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let stripped = chapterPrefix.stringByReplacingMatches(in: value, range: NSRange(value.startIndex..., in: value), withTemplate: "")
+        return cleanTitle(stripped.nonEmpty ?? value)
+    }
+
     /// YouTube: music metadata first, then "Artist - Title" in the upload title, then the channel.
     static func youTube(title: String, channel: String, artist: String?, track: String?) -> (title: String, artist: String) {
         if let artist = artist?.nonEmpty, let track = track?.nonEmpty { return (cleanTitle(track), artist) }

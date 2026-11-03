@@ -146,6 +146,7 @@ struct DropPanel: View {
     @State private var historyQuery = ""
     @State private var historyFilter = HistoryFilter.all
     @State private var historyLimit = 100
+    @State private var showingStats = false
     @State private var creatingPlaylist = false
     @State private var newPlaylistName = ""
 
@@ -296,6 +297,12 @@ struct DropPanel: View {
                 Text("ПОСЛЕДНИЕ ДОБАВЛЕНИЯ")
                     .font(.system(size: 10, weight: .semibold)).tracking(0.8).foregroundStyle(.secondary)
                 Spacer()
+                if store.entries.contains(where: { $0.stage == .imported }) {
+                    Button { showingStats.toggle() } label: {
+                        Image(systemName: showingStats ? "chart.bar.fill" : "chart.bar").font(.system(size: 11))
+                    }
+                    .buttonStyle(.borderless).help("Твой год").accessibilityLabel(showingStats ? "Скрыть статистику" : "Показать статистику за год")
+                }
                 if store.activeCount > 0 {
                     Text("В очереди: \(store.activeCount)").font(.system(size: 10)).foregroundStyle(.secondary)
                 } else if !store.entries.isEmpty {
@@ -306,6 +313,9 @@ struct DropPanel: View {
                     .buttonStyle(.borderless).help("Проверить облачный статус")
                     .accessibilityLabel("Проверить облачный статус")
                 }
+            }
+            if showingStats {
+                StatsView(entries: store.entries, tint: accent)
             }
             if store.entries.isEmpty {
                 VStack(spacing: 7) {
@@ -543,10 +553,24 @@ struct DropPanel: View {
     }
 }
 
+private struct TrimFields {
+    static func parse(_ text: String) -> (value: Double?, valid: Bool) {
+        let value = text.trimmingCharacters(in: .whitespaces)
+        if value.isEmpty { return (nil, true) }
+        guard let seconds = TrackAdjustments.seconds(value) else { return (nil, false) }
+        return (seconds, true)
+    }
+}
+
 private struct HistoryRow: View {
     let entry: ImportEntry
     let store: ImportStore
     @State private var confirmingDelete = false
+    @State private var editingTrim = false
+    @State private var startText = ""
+    @State private var finishText = ""
+    @State private var trimProblem: String?
+    @State private var savingTrim = false
 
     private var working: Bool {
         entry.stage == .queued || entry.stage == .importing || store.updatingFavorites.contains(entry.id)
@@ -567,6 +591,56 @@ private struct HistoryRow: View {
             return entry.cloudStatus == "missing" ? "Трек больше не найден в «Музыке»" : CloudState.label(entry.cloudStatus)
         }
     }
+    private var trimEditor: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Text("Звучит с").font(.system(size: 11))
+                TextField("0:00", text: $startText).textFieldStyle(.roundedBorder).controlSize(.small).frame(width: 62)
+                    .accessibilityLabel("Начало")
+                Text("до").font(.system(size: 11))
+                TextField(entry.duration.map(TrackAdjustments.label) ?? "конца", text: $finishText)
+                    .textFieldStyle(.roundedBorder).controlSize(.small).frame(width: 62).accessibilityLabel("Конец")
+                    .onSubmit(saveTrim)
+                if store.updatingAdjustments.contains(entry.id) { ProgressView().controlSize(.mini) }
+            }
+            if let trimProblem {
+                Text(trimProblem).font(.system(size: 10)).foregroundStyle(.orange)
+            }
+            HStack(spacing: 12) {
+                Button("Сохранить", action: saveTrim).buttonStyle(.borderedProminent).controlSize(.small).tint(accent)
+                if entry.adjustments?.isTrimmed == true {
+                    Button("Весь трек") { trimProblem = nil; savingTrim = true; store.trim(entry, start: nil, finish: nil) }.buttonStyle(.borderless)
+                }
+                Button("Отмена") { editingTrim = false }.buttonStyle(.borderless)
+            }
+            .font(.system(size: 11))
+            .disabled(store.updatingAdjustments.contains(entry.id))
+            Text("«Музыка» будет играть только этот отрезок на всех устройствах; сам файл не меняется.")
+                .font(.system(size: 10)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.leading, 44)
+    }
+
+    private func beginTrim() {
+        startText = entry.adjustments?.start.map(TrackAdjustments.label) ?? ""
+        finishText = entry.adjustments?.finish.map(TrackAdjustments.label) ?? ""
+        trimProblem = nil
+        editingTrim = true
+    }
+
+    private func saveTrim() {
+        let start = TrimFields.parse(startText), finish = TrimFields.parse(finishText)
+        guard start.valid, finish.valid else { trimProblem = "Время пишется так: 1:05 или 65."; return }
+        do {
+            let checked = try TrackAdjustments.trim(start: start.value, finish: finish.value, duration: entry.duration)
+            trimProblem = nil
+            savingTrim = true
+            store.trim(entry, start: checked.start, finish: checked.finish)
+        } catch {
+            trimProblem = error.localizedDescription
+        }
+    }
+
     private var symbol: String {
         if warning { return "exclamationmark.triangle" }
         if CloudState.isReady(entry.cloudStatus) { return "checkmark.icloud" }
@@ -616,6 +690,16 @@ private struct HistoryRow: View {
                 Text(error).font(.system(size: 11)).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true).padding(.leading, 44)
             }
+            if let trim = entry.adjustments, trim.isTrimmed, !editingTrim {
+                Label("Звучит " + TrackAdjustments.label(trim.start ?? 0) + " – "
+                      + (trim.finish.map(TrackAdjustments.label) ?? entry.duration.map(TrackAdjustments.label) ?? "конец"), systemImage: "scissors")
+                    .font(.system(size: 10)).foregroundStyle(.secondary).padding(.leading, 44)
+            }
+            if let problem = entry.adjustmentError {
+                Text("Не удалось изменить трек в «Музыке»: " + problem).font(.system(size: 11)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true).padding(.leading, 44)
+            }
+            if editingTrim { trimEditor }
             if let problem = entry.favoriteError {
                 Text(problem).font(.system(size: 11)).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true).padding(.leading, 44)
@@ -665,6 +749,8 @@ private struct HistoryRow: View {
                     .disabled(store.cloudUpdateInProgress)
                 Button("Добавить в избранное") { store.markFavorite(entry) }
                     .disabled(store.updatingFavorites.contains(entry.id))
+                Button("Обрезать начало и конец…") { beginTrim() }
+                    .disabled(store.updatingAdjustments.contains(entry.id))
             }
             if entry.stage == .failed { Button("Повторить") { store.retry(entry) } }
             if let path = entry.managedPath {
@@ -682,6 +768,11 @@ private struct HistoryRow: View {
             if entry.stage == .imported, entry.trackID != nil {
                 Button("Удалить из медиатеки…", role: .destructive) { confirmingDelete = true }
             }
+        }
+        .onChange(of: store.updatingAdjustments) {
+            guard savingTrim, !store.updatingAdjustments.contains(entry.id) else { return }
+            savingTrim = false
+            if store.entries.first(where: { $0.id == entry.id })?.adjustmentError == nil { editingTrim = false }
         }
         .confirmationDialog("Удалить «\(entry.title)» из медиатеки «Музыки»?", isPresented: $confirmingDelete) {
             Button("Удалить", role: .destructive) { store.deleteFromLibrary(entry) }

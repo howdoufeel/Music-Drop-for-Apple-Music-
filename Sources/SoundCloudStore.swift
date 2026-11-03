@@ -16,6 +16,8 @@ import Observation
     private(set) var previewLoading = false
     private(set) var previewIsClip = false
     var previewErrors: [String: String] = [:]
+    /// Start and end marked while listening; applied in Music when the track is added.
+    private(set) var trims: [String: TrackAdjustments] = [:]
     /// An opened set; while it is shown the normal results are hidden.
     private(set) var collection: SoundCloudCollection?
     var selection: Set<String> = []
@@ -241,6 +243,31 @@ import Observation
                 }
             }
         }
+    }
+
+    /// Marks where the track should start or end, from the listening position.
+    func markTrim(_ track: SoundCloudTrack, start: Double? = nil, finish: Double? = nil) {
+        var trim = trims[track.id] ?? TrackAdjustments()
+        if let start { trim.start = start }
+        if let finish { trim.finish = finish }
+        do {
+            let checked = try TrackAdjustments.trim(start: trim.start, finish: trim.finish, duration: track.duration)
+            trim.start = checked.start
+            trim.finish = checked.finish
+            trims[track.id] = trim.isEmpty ? nil : trim
+            previewErrors[track.id] = nil
+        } catch {
+            previewErrors[track.id] = error.localizedDescription
+        }
+    }
+
+    func clearTrim(_ track: SoundCloudTrack) {
+        trims[track.id] = nil
+    }
+
+    /// Hands the marks to the import once; later adds of the same track start clean.
+    func takeTrim(for id: String) -> TrackAdjustments? {
+        trims.removeValue(forKey: id)
     }
 
     func stopPreview() {

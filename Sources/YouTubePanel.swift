@@ -140,6 +140,34 @@ struct YouTubePanel: View {
         else { model.search() }
     }
 
+    /// A video with chapters can become an album: one track per chapter, numbered in order.
+    private func chapters(_ track: YouTubeTrack) -> some View {
+        let added = imports.chapterEntries(youTubeID: track.id).filter { $0.stage == .imported }.count
+        return VStack(alignment: .leading, spacing: 6) {
+            Button { model.addChapters(track) } label: {
+                Label("Добавить по главам: " + CollectionHeader.tracks(track.chapters.count), systemImage: "list.number")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            if added > 0 {
+                Text("Глав в медиатеке: \(added) из \(track.chapters.count)").font(.system(size: 10)).foregroundStyle(.secondary)
+            }
+            DisclosureGroup("Главы") {
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(Array(track.chapters.enumerated()), id: \.offset) { index, chapter in
+                        HStack(alignment: .firstTextBaseline, spacing: 6) {
+                            Text(TrackAdjustments.label(chapter.start)).monospacedDigit().foregroundStyle(.secondary)
+                                .frame(width: 48, alignment: .leading)
+                            Text(chapter.title).lineLimit(1)
+                        }
+                    }
+                }
+                .padding(.top, 4)
+            }
+            .font(.system(size: 10))
+        }
+    }
+
     private func row(_ track: YouTubeTrack) -> some View {
         let entry = imports.entry(youTubeID: track.id)
         return VStack(alignment: .leading, spacing: 12) {
@@ -205,6 +233,7 @@ struct YouTubePanel: View {
                 Button { model.add(track) } label: {
                     Label("Добавить в Apple Music", systemImage: "plus").frame(maxWidth: .infinity)
                 }.buttonStyle(.borderedProminent).tint(.red)
+                if track.chapters.count >= 2 { chapters(track) }
             }
             Button("Открыть на YouTube") { NSWorkspace.shared.open(track.url) }
                 .buttonStyle(.borderless).font(.system(size: 10)).foregroundStyle(.secondary)

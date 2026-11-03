@@ -28,6 +28,7 @@ struct ImportServices {
     var addToPlaylist: (String, String) throws -> Void = MusicBridge.addToPlaylist
     var playlistNames: () throws -> [String] = MusicBridge.playlistNames
     var deleteTrack: (String) throws -> Void = MusicBridge.deleteTrack
+    var adjust: (String, TrackAdjustments) throws -> Void = MusicBridge.adjust
 }
 
 /// Coalesces history writes off the main thread; the newest snapshot always wins.
@@ -72,6 +73,7 @@ private final class HistoryWriter {
     /// The user's playlists as Music last listed them.
     private(set) var availablePlaylists: [String] = []
     var updatingPlaylists: Set<UUID> = []
+    var updatingAdjustments: Set<UUID> = []
     // Derived from entries once per change, so views and timers never rescan the history.
     private(set) var activeImportCount = 0
     private(set) var successfulCount = 0
@@ -104,7 +106,7 @@ private final class HistoryWriter {
     static let playlistsKey = "KnownPlaylists"
 
     var activeCount: Int {
-        activeImportCount + updatingFavorites.count + updatingPlaylists.count + (cloudUpdateInProgress ? 1 : 0)
+        activeImportCount + updatingFavorites.count + updatingPlaylists.count + updatingAdjustments.count + (cloudUpdateInProgress ? 1 : 0)
     }
     /// Newest entry for a source track, ignoring ones removed from Music.
     func entry(soundCloudID id: String) -> ImportEntry? { soundCloudEntries[id] }
@@ -254,7 +256,7 @@ private final class HistoryWriter {
     }
 
     /// `playlist` overrides the chosen destination, as when a whole set goes into its own playlist.
-    func acceptSoundCloud(_ url: URL, track: SoundCloudTrack, playlist: String? = nil) {
+    func acceptSoundCloud(_ url: URL, track: SoundCloudTrack, playlist: String? = nil, adjustments: TrackAdjustments? = nil) {
         guard !preview else { return }
         let target = playlist ?? destination
         if let existing = entries.first(where: {
@@ -263,21 +265,22 @@ private final class HistoryWriter {
             notice = "«\(existing.title)» уже в медиатеке. Обновляем избранное и облако."
             markFavorite(existing)
             if let target { addToPlaylist(existing, playlist: target) }
+            if let adjustments { adjust(existing, adjustments) }
             return
         }
         let entry = ImportEntry(sourcePath: url.path, title: track.title,
                                 soundCloudID: track.id, soundCloudURL: track.url, playlist: target,
-                                artist: track.artist, duration: track.duration)
+                                artist: track.artist, duration: track.duration, adjustments: adjustments)
         entries.insert(entry, at: 0)
         save()
         performImport(entry)
     }
 
-    func acceptYouTube(_ url: URL, track: YouTubeTrack, playlist: String? = nil) {
+    func acceptYouTube(_ url: URL, track: YouTubeTrack, playlist: String? = nil, adjustments: TrackAdjustments? = nil) {
         guard !preview else { return }
         let target = playlist ?? destination
         if let existing = entries.first(where: {
-            $0.youtubeID == track.id && $0.cloudStatus != "missing"
+            $0.youtubeID == track.libraryID && $0.cloudStatus != "missing"
         }) {
             if existing.stage == .imported {
                 markFavorite(existing)
@@ -287,11 +290,42 @@ private final class HistoryWriter {
             return
         }
         let entry = ImportEntry(sourcePath: url.path, title: track.title,
-                                youtubeID: track.id, youtubeURL: track.url, playlist: target,
-                                artist: track.artist, duration: track.duration)
+                                youtubeID: track.libraryID, youtubeURL: track.url, playlist: target,
+                                artist: track.artist, duration: track.duration, adjustments: adjustments)
         entries.insert(entry, at: 0)
         save()
         performImport(entry)
+    }
+
+    /// Sets where an imported track starts and ends in Music; nil restores that end of the track.
+    func trim(_ entry: ImportEntry, start: Double?, finish: Double?) {
+        var adjustments = entry.adjustments ?? TrackAdjustments()
+        adjustments.start = start
+        adjustments.finish = finish
+        adjust(entry, adjustments)
+    }
+
+    func adjust(_ entry: ImportEntry, _ adjustments: TrackAdjustments) {
+        guard !preview, entry.stage == .imported, let trackID = entry.trackID, !updatingAdjustments.contains(entry.id) else { return }
+        updatingAdjustments.insert(entry.id)
+        queue.async { [weak self] in
+            guard let self else { return }
+            let result = Result { try self.services.adjust(trackID, adjustments) }
+            DispatchQueue.main.async {
+                self.updatingAdjustments.remove(entry.id)
+                self.update(entry.id) {
+                    switch result {
+                    case .success: $0.adjustments = adjustments.isEmpty ? nil : adjustments; $0.adjustmentError = nil
+                    case .failure(let error): $0.adjustmentError = error.localizedDescription
+                    }
+                }
+            }
+        }
+    }
+
+    /// The chapters of a video already in the history, by their position.
+    func chapterEntries(youTubeID id: String) -> [ImportEntry] {
+        youTubeEntries.filter { $0.key.hasPrefix(id + "#") }.map(\.value)
     }
 
     func markFavorite(_ entry: ImportEntry) {
@@ -496,6 +530,11 @@ private final class HistoryWriter {
                     do { try self.services.addToPlaylist(result.id, playlist) }
                     catch { playlistProblem = error.localizedDescription }
                 }
+                var adjustmentProblem: String?
+                if let adjustments = entry.adjustments, !adjustments.isEmpty {
+                    do { try self.services.adjust(result.id, adjustments) }
+                    catch { adjustmentProblem = error.localizedDescription }
+                }
                 // Timings in Console.app (process "Music Drop") show where an import waited.
                 NSLog("Music Drop import: queued %.2f s, file checks %.2f s, Music %.2f s, Music launched: %d",
                       started.timeIntervalSince(enqueued), adding.timeIntervalSince(started), Date().timeIntervalSince(adding),
@@ -507,6 +546,7 @@ private final class HistoryWriter {
                         $0.cloudStatus = result.cloudStatus; $0.stage = .imported; $0.error = nil
                         $0.isFavorite = result.isFavorite; $0.favoriteError = result.favoriteError
                         $0.playlistError = playlistProblem
+                        $0.adjustmentError = adjustmentProblem
                         $0.artist = result.artist ?? $0.artist
                         $0.duration = result.duration ?? $0.duration
                     }

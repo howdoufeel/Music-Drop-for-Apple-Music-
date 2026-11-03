@@ -88,12 +88,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         }
         previewPlayer.onFinish = { [weak self] failed in self?.soundCloud.previewEnded(failed: failed) }
         youtube.onReady = { [weak self] file, track in
-            self?.store.acceptYouTube(file, track: track, playlist: self?.youtube.playlistTarget(for: track.id))
+            guard let self else { return }
+            self.store.acceptYouTube(file, track: track, playlist: track.part == nil ? self.youtube.playlistTarget(for: track.id) : nil,
+                                     adjustments: self.youtube.adjustments(for: track.libraryID))
         }
         youtube.onActivity = { [weak self] in self?.updateActivity() }
         youtube.shouldPrefetch = { [weak self] track in self?.store.entry(youTubeID: track.id) == nil }
         soundCloud.onReady = { [weak self] file, track in
-            self?.store.acceptSoundCloud(file, track: track, playlist: self?.soundCloud.playlistTarget(for: track.id))
+            guard let self else { return }
+            self.store.acceptSoundCloud(file, track: track, playlist: self.soundCloud.playlistTarget(for: track.id),
+                                        adjustments: self.soundCloud.takeTrim(for: track.id))
         }
         soundCloud.onActivity = { [weak self] in self?.updateActivity() }
         statusItem = NSStatusBar.system.statusItem(withLength: 30)

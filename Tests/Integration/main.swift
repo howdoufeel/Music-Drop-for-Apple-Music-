@@ -295,6 +295,70 @@ do {
            "deleting from the library removes the Music track, its entry and Music Drop's copy")
 }
 
+// Trims and album positions are set in Music after the import, and later from the history.
+do {
+    var adjusted: [(String, TrackAdjustments)] = []
+    var adjustFailure: Error?
+    var adjustServices = services
+    adjustServices.musicIsRunning = { true }
+    adjustServices.adjust = { id, value in
+        adjusted.append((id, value))
+        if let adjustFailure { throw adjustFailure }
+    }
+    let adjustStore = ImportStore(directory: root.appendingPathComponent("AdjustState"), services: adjustServices, startTimer: false,
+                                  defaults: UserDefaults(suiteName: "musicdrop-adjust-" + UUID().uuidString)!)
+    let trimFile = root.appendingPathComponent("trim-me.mp3")
+    try Data("trim-me".utf8).write(to: trimFile)
+    let trimTrack = SoundCloudTrack(id: "trim-1", title: "Длинное интро", artist: "Автор", url: URL(string: "https://soundcloud.com/a/intro")!, duration: 240)
+    adjustStore.acceptSoundCloud(trimFile, track: trimTrack, adjustments: TrackAdjustments(start: 12, finish: 200))
+    settle(adjustStore)
+    expect(adjustStore.entries[0].stage == .imported && adjusted.count == 1 && adjusted[0].0 == "00000000000000A1"
+           && adjusted[0].1 == TrackAdjustments(start: 12, finish: 200) && adjustStore.entries[0].adjustments?.start == 12,
+           "a trim marked before adding is applied right after the import")
+    adjustStore.trim(adjustStore.entries[0], start: nil, finish: 180)
+    settle(adjustStore)
+    expect(adjusted.last?.1 == TrackAdjustments(finish: 180) && adjustStore.entries[0].adjustments == TrackAdjustments(finish: 180),
+           "a trim changed from the history replaces the old one")
+    adjustFailure = DropError.message("Трек занят")
+    adjustStore.trim(adjustStore.entries[0], start: 5, finish: nil)
+    settle(adjustStore)
+    expect(adjustStore.entries[0].adjustmentError == "Трек занят" && adjustStore.entries[0].adjustments == TrackAdjustments(finish: 180),
+           "a refused change keeps the previous trim and explains itself")
+    adjustFailure = nil
+    adjustStore.trim(adjustStore.entries[0], start: nil, finish: nil)
+    settle(adjustStore)
+    expect(adjustStore.entries[0].adjustments == nil && adjustStore.entries[0].adjustmentError == nil, "the whole track can be restored")
+    let failingFile = root.appendingPathComponent("trim-fail.mp3")
+    try Data("trim-fail".utf8).write(to: failingFile)
+    adjustFailure = DropError.message("Нет доступа")
+    adjustStore.acceptSoundCloud(failingFile, track: SoundCloudTrack(id: "trim-2", title: "Второй", artist: "Автор",
+                                                                    url: URL(string: "https://soundcloud.com/a/second")!),
+                                 adjustments: TrackAdjustments(start: 3))
+    settle(adjustStore)
+    expect(adjustStore.entries[0].stage == .imported && adjustStore.entries[0].adjustmentError == "Нет доступа",
+           "a failed trim never undoes the import")
+    adjustFailure = nil
+}
+expect(TrackAdjustments.seconds("1:05") == 65 && TrackAdjustments.seconds("1:02:03") == 3_723 && TrackAdjustments.seconds("65,5") == 65.5
+       && TrackAdjustments.seconds(" 12 ") == 12, "times are read as m:ss, h:mm:ss or seconds")
+expect(TrackAdjustments.seconds("1:60") == nil && TrackAdjustments.seconds("-5") == nil && TrackAdjustments.seconds("abc") == nil
+       && TrackAdjustments.seconds("") == nil && TrackAdjustments.seconds("1::2") == nil && TrackAdjustments.seconds("1.5:00") == nil,
+       "anything else is refused")
+expect(TrackAdjustments.label(65) == "1:05" && TrackAdjustments.label(3_723) == "1:02:03" && TrackAdjustments.label(-3) == "0:00", "times are shown as m:ss")
+let checkedTrim = try TrackAdjustments.trim(start: 0, finish: 240, duration: 240)
+expect(checkedTrim.start == nil && checkedTrim.finish == nil, "a trim to the very ends means the whole track")
+expect((try? TrackAdjustments.trim(start: 10, finish: 10.5, duration: 240)) == nil && (try? TrackAdjustments.trim(start: 239.5, finish: nil, duration: 240)) == nil
+       && (try? TrackAdjustments.trim(start: 30, finish: 20, duration: nil)) == nil, "a trim must leave at least a second")
+let adjustScript = MusicBridge.adjustSource(id: "ABC", adjustments: TrackAdjustments(start: 12.5, finish: 200, number: 2, count: 9, albumArtist: "Группа \"Х\""))
+let finishOpen = adjustScript.range(of: "set finish of selectedTrack to (duration of selectedTrack)")
+let startSet = adjustScript.range(of: "set start of selectedTrack to 12.500")
+expect(finishOpen != nil && startSet != nil && finishOpen!.lowerBound < startSet!.lowerBound
+       && adjustScript.contains("if 200.000 < (duration of selectedTrack) then set finish of selectedTrack to 200.000")
+       && adjustScript.contains("set track number of selectedTrack to 2") && adjustScript.contains("set track count of selectedTrack to 9")
+       && adjustScript.contains("set album artist of selectedTrack to \"Группа \\\"Х\\\"\""),
+       "the Music script opens the range before setting a start and quotes the album artist")
+expect(MusicBridge.adjustSource(id: "ABC", adjustments: TrackAdjustments()).contains("set start of selectedTrack to 0"), "no start means the beginning")
+
 // A chosen playlist receives every new track; existing tracks join it without another import.
 do {
     let playlistDefaults = UserDefaults(suiteName: "musicdrop-tests-" + UUID().uuidString)!
@@ -1373,6 +1437,49 @@ failArtist = false
 subscriptionStore.unfollow("9")
 expect(subscriptionStore.subscriptions.isEmpty && subscriptionStore.fresh.isEmpty, "unfollowing drops the artist and their new tracks")
 
+// Marks made while listening travel with the track once.
+let markModel = SoundCloudStore(service: BrowseFixture(), directory: root.appendingPathComponent("Marks"))
+let markTrack = SoundCloudTrack(id: "mark", title: "Отметки", artist: "Автор", url: URL(string: "https://soundcloud.com/a/mark")!, duration: 180)
+markModel.markTrim(markTrack, start: 15)
+markModel.markTrim(markTrack, finish: 170)
+expect(markModel.trims["mark"] == TrackAdjustments(start: 15, finish: 170), "start and end can be marked separately")
+markModel.markTrim(markTrack, finish: 10)
+expect(markModel.trims["mark"] == TrackAdjustments(start: 15, finish: 170) && markModel.previewErrors["mark"] != nil, "an end before the start is refused")
+expect(markModel.takeTrim(for: "mark") == TrackAdjustments(start: 15, finish: 170) && markModel.takeTrim(for: "mark") == nil,
+       "the marks are handed to the import once")
+
+// "Твой год" counts what reached Music.
+var statsCalendar = Calendar(identifier: .gregorian)
+statsCalendar.timeZone = TimeZone(identifier: "UTC")!
+func statsEntry(_ day: String, artist: String?, source: String?, duration: Double? = 200, stage: ImportStage = .imported, playlist: String? = nil) -> ImportEntry {
+    let formatter = ISO8601DateFormatter()
+    var entry = ImportEntry(sourcePath: "", title: day, date: formatter.date(from: day + "T12:00:00Z")!, stage: stage, playlist: playlist,
+                            artist: artist, duration: duration)
+    if source == "sc" { entry.soundCloudID = UUID().uuidString }
+    if source == "yt" { entry.youtubeID = UUID().uuidString }
+    return entry
+}
+let statsEntries = [statsEntry("2026-01-05", artist: "Земфира", source: "sc", playlist: "Бег"),
+                    statsEntry("2026-01-06", artist: "земфира", source: "yt", playlist: "Бег"),
+                    statsEntry("2026-01-07", artist: "Кино", source: nil),
+                    statsEntry("2026-01-07", artist: "Кино", source: "sc", duration: nil),
+                    statsEntry("2026-03-07", artist: "Кино", source: "sc"),
+                    statsEntry("2026-03-08", artist: "Земфира", source: "sc", stage: .failed),
+                    statsEntry("2025-12-31", artist: "Сплин", source: "yt")]
+let stats2026 = LibraryStats.make(statsEntries, year: 2026, calendar: statsCalendar)
+expect(stats2026.tracks == 5 && stats2026.seconds == 800 && stats2026.soundCloud == 3 && stats2026.youTube == 1 && stats2026.files == 1,
+       "only tracks that reached Music this year count, by source")
+expect(stats2026.months[0] == 4 && stats2026.months[2] == 1 && stats2026.months.reduce(0, +) == 5, "tracks are counted per month")
+expect(stats2026.artists == [LibraryStats.Count(name: "Кино", count: 3), LibraryStats.Count(name: "Земфира", count: 2)],
+       "artists are ranked, ignoring case")
+expect(stats2026.longestStreak == 3 && stats2026.busiestDayCount == 2 && stats2026.playlists.first == LibraryStats.Count(name: "Бег", count: 2),
+       "the longest run of days, the busiest day and the favourite playlist are found")
+expect(LibraryStats.years(statsEntries, calendar: statsCalendar) == [2026, 2025] && LibraryStats.make(statsEntries, year: 2024, calendar: statsCalendar).tracks == 0,
+       "years with imports are listed newest first")
+expect(LibraryStats.plural(1, "трек", "трека", "треков") == "1 трек" && LibraryStats.plural(22, "трек", "трека", "треков") == "22 трека"
+       && LibraryStats.plural(11, "трек", "трека", "треков") == "11 треков" && LibraryStats.listening(5_400) == "1,5 ч"
+       && LibraryStats.listening(600) == "10 мин", "numbers are worded in Russian")
+
 // A watched folder imports MP3s once they stop changing.
 let watched = root.appendingPathComponent("Watched", isDirectory: true)
 try FileManager.default.createDirectory(at: watched, withIntermediateDirectories: true)
@@ -1616,6 +1723,33 @@ if CommandLine.arguments.count > 1 {
         expect(probed.contains("attached_pic=1") && probed.contains("Трек / один") && probed.contains("Автор"),
                "a YouTube \(format.label) file carries its cover, title and artist")
     }
+    // A real cut: four seconds of AAC become two chapter files of about two seconds each.
+    let longAAC = root.appendingPathComponent("YTLong/Prepared/long.m4a")
+    try FileManager.default.createDirectory(at: longAAC.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let longMaker = Process()
+    longMaker.executableURL = ffmpegYT
+    longMaker.arguments = ["-nostdin", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-t", "4", "-c:a", "aac", longAAC.path]
+    try longMaker.run(); longMaker.waitUntilExit()
+    func ytDuration(_ file: URL) -> Double {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/ffprobe")
+        process.arguments = ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", file.path]
+        let pipe = Pipe(); process.standardOutput = pipe
+        try? process.run(); process.waitUntilExit()
+        return Double(String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+    }
+    let splitService = YouTubeService(helper:helperYT,ffmpeg:ffmpegYT,runtime:URL(fileURLWithPath:"/usr/bin/true"),cache:root.appendingPathComponent("YTSplit"),
+                                      fallback:nil,format:{ .m4a },artwork:{ _, _ in ytCoverJPEG })
+    let splitVideo = YouTubeTrack(id: ytID, title: "Сборник", artist: "Канал",
+                                  chapters: [YouTubeChapter(title: "Первая", start: 0, end: 2), YouTubeChapter(title: "Гость - Вторая", start: 2, end: 4)])
+    var splitStages: [String] = []
+    let splitParts = try splitService.split(longAAC, track: splitVideo, cancellation: SoundCloudCancellation(), stage: { splitStages.append($0) })
+    let partDurations = splitParts.map { ytDuration($0.0) }
+    expect(splitParts.count == 2 && partDurations.allSatisfy { abs($0 - 2) < 0.2 } && !FileManager.default.fileExists(atPath: longAAC.path)
+           && splitStages.last == "Делим на главы: 2 из 2", "a video is cut into chapter files of the right length and the whole file is removed")
+    let splitProbe = ytProbe(splitParts[1].0)
+    expect(splitParts[1].1.title == "Вторая" && splitParts[1].1.artist == "Гость" && splitParts[1].1.album == "Сборник"
+           && splitProbe.contains("attached_pic=1") && splitProbe.contains("Вторая"), "each chapter file carries its own title, the album and the cover")
     // With a direct stream in the extractor's JSON, the audio comes straight from Google's servers.
     GoogleVideoFixture.payload = try Data(contentsOf: fixtureYT)
     let directLog = root.appendingPathComponent("yt-direct-arguments")
@@ -2122,6 +2256,71 @@ expect(schemeAdd?.route == .youTube("https://youtu.be/\(ytID)") && schemeAdd?.ad
 expect(LinkRoute.scheme(URL(string: "musicdrop://delete?url=https%3A%2F%2Fyoutu.be%2F\(ytID)")!) == nil
        && LinkRoute.scheme(URL(string: "musicdrop://add?url=https%3A%2F%2Fexample.com")!) == nil
        && LinkRoute.scheme(URL(string: "https://add?url=x")!) == nil, "unknown actions, foreign links and other schemes are ignored")
+
+// Chapters become numbered tracks of one album.
+let chapterInfo: [[String: Any]] = [["start_time": 0, "end_time": 95.5, "title": "01. Intro"],
+                                    ["start_time": 95.5, "end_time": 300, "title": "03:15 - Гость - Песня"],
+                                    ["start_time": 300, "end_time": 900, "title": "  "]]
+let parsedChapters = YouTubeService.parseChapters(chapterInfo, duration: 600)
+expect(parsedChapters.map(\.title) == ["Intro", "Гость - Песня", "Часть 3"] && parsedChapters.last?.end == 600,
+       "chapter numbers and times are dropped from titles and the last one ends with the video")
+expect(YouTubeService.parseChapters([["start_time": 0, "end_time": 50, "title": "a"]], duration: nil).isEmpty
+       && YouTubeService.parseChapters([["start_time": 0, "end_time": 50, "title": "a"], ["start_time": 20, "end_time": 80, "title": "b"]], duration: nil).isEmpty
+       && YouTubeService.parseChapters([["start_time": 0, "end_time": 50, "title": "a"], ["start_time": 50, "end_time": 50.4, "title": "b"]], duration: nil).isEmpty
+       && YouTubeService.parseChapters("nope", duration: nil).isEmpty, "a single, overlapping or empty chapter list means none")
+expect(TrackMetadata.chapterTitle("[1:02:03] Финал (Official Video)") == "Финал" && TrackMetadata.chapterTitle("12) Song") == "Song"
+       && TrackMetadata.chapterTitle("2 - Song") == "Song" && TrackMetadata.chapterTitle("1999") == "1999", "chapter titles are cleaned like video titles")
+var chapterJSON = try JSONSerialization.jsonObject(with: ytJSON) as! [String: Any]
+chapterJSON["chapters"] = chapterInfo; chapterJSON["duration"] = 600
+let chapteredTrack = try YouTubeService.parseTrack(try JSONSerialization.data(withJSONObject: chapterJSON), expectedID: ytID)
+expect(chapteredTrack.chapters.count == 3 && chapteredTrack.libraryID == ytID, "the extractor's chapters reach the video's card")
+let partTrack = YouTubeTrack(id: ytID, title: "Песня", artist: "Гость", part: YouTubeTrackPart(number: 2, count: 3, start: 95.5))
+expect(partTrack.libraryID == ytID + "#2" && partTrack.url.absoluteString == "https://www.youtube.com/watch?v=\(ytID)&t=95s",
+       "a chapter is its own history entry and links to its moment in the video")
+let chapterArguments = YouTubeService.chapterArguments(source: URL(fileURLWithPath: "/tmp/in.mp3"), output: URL(fileURLWithPath: "/tmp/02.mp3"),
+                                                       start: 95.5, length: 204.5, mp3: true,
+                                                       tags: AudioTags(title: "Песня", artist: "Гость", album: "Сборник", comment: "c"), cover: nil)
+let inputIndex = chapterArguments.firstIndex(of: "-i")!
+expect(chapterArguments[..<inputIndex].contains("-ss") && chapterArguments.contains("95.500") && chapterArguments.contains("204.500")
+       && chapterArguments.contains("copy") && chapterArguments.contains("-id3v2_version") && chapterArguments.last == "/tmp/02.mp3",
+       "FFmpeg cuts a chapter by seeking before the input and copying the stream")
+
+final class ChapterFixture: YouTubeProviding {
+    var failSplit = false
+    func resolve(_ input: String, cancellation: SoundCloudCancellation) throws -> YouTubeTrack { throw DropError.message("нет") }
+    func download(_ track: YouTubeTrack, directory: URL, cancellation: SoundCloudCancellation, stage: @escaping (String) -> Void) throws -> URL {
+        let file = directory.appendingPathComponent(UUID().uuidString).appendingPathComponent("Prepared").appendingPathComponent("video.m4a")
+        try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("video".utf8).write(to: file)
+        return file
+    }
+    func split(_ file: URL, track: YouTubeTrack, cancellation: SoundCloudCancellation, stage: @escaping (String) -> Void) throws -> [(URL, YouTubeTrack)] {
+        if failSplit { throw DropError.message("сломано") }
+        return track.chapters.enumerated().map { index, chapter in
+            (file.deletingLastPathComponent().appendingPathComponent("\(index + 1).m4a"),
+             YouTubeTrack(id: track.id, title: chapter.title, artist: track.artist, album: track.title,
+                          part: YouTubeTrackPart(number: index + 1, count: track.chapters.count, start: chapter.start)))
+        }
+    }
+}
+let chapterProvider = ChapterFixture()
+let chapterStore = YouTubeStore(service: chapterProvider, directory: root.appendingPathComponent("Chapters"), prefetch: false)
+var chapterHandoffs: [(String, TrackAdjustments?)] = []
+chapterStore.onReady = { _, track in chapterHandoffs.append((track.libraryID, chapterStore.adjustments(for: track.libraryID))) }
+let albumVideo = YouTubeTrack(id: ytID, title: "Альбом целиком", artist: "Группа", chapters: parsedChapters)
+chapterStore.addChapters(albumVideo)
+waitUI { !chapterStore.isDownloading }
+expect(chapterHandoffs.map(\.0) == [ytID + "#1", ytID + "#2", ytID + "#3"]
+       && chapterHandoffs[1].1 == TrackAdjustments(number: 2, count: 3, albumArtist: "Группа"),
+       "each chapter is handed off with its number, the count and the video's artist for the album")
+chapterProvider.failSplit = true
+chapterStore.addChapters(albumVideo)
+waitUI { !chapterStore.isDownloading }
+expect(chapterHandoffs.count == 3 && chapterStore.downloadErrors[ytID]?.contains("сломано") == true, "a failed split reports itself and adds nothing")
+chapterProvider.failSplit = false
+chapterStore.add(albumVideo)
+waitUI { !chapterStore.isDownloading }
+expect(chapterHandoffs.last?.0 == ytID && chapterHandoffs.last?.1 == nil, "a plain add still adds the whole video")
 
 let progressLog = root.appendingPathComponent("progress.log")
 try Data("[download] noise\nMDPROGRESS 50 200\nMDPROGRESS 10 NA\nMDPROGRESS 100 2".utf8).write(to: progressLog)

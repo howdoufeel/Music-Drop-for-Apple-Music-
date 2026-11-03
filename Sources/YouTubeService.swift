@@ -1,15 +1,36 @@
 import Foundation
 import Darwin
 
+/// A chapter from the video's description, as yt-dlp reports it.
+struct YouTubeChapter: Equatable {
+    let title: String
+    let start: Double
+    let end: Double
+}
+
+/// Marks a track cut from one chapter of a video.
+struct YouTubeTrackPart: Equatable {
+    let number: Int
+    let count: Int
+    let start: Double
+}
+
 struct YouTubeTrack: Identifiable, Equatable {
     let id: String
     let title: String
     let artist: String
-    var url: URL { URL(string: "https://www.youtube.com/watch?v=" + id)! }
+    var url: URL {
+        let watch = "https://www.youtube.com/watch?v=" + id
+        return URL(string: part.map { watch + "&t=\(Int($0.start))s" } ?? watch)!
+    }
     var duration: Double?
     var fallbackEndpoint: URL?
     var album: String?
     var year: Int?
+    var chapters: [YouTubeChapter] = []
+    var part: YouTubeTrackPart?
+    /// Chapters of one video are separate tracks in the history.
+    var libraryID: String { part.map { id + "#" + String($0.number) } ?? id }
     var durationLabel: String {
         guard let duration, duration.isFinite, duration >= 0 else { return "" }
         let seconds = Int(min(duration, 864_000))
@@ -72,6 +93,9 @@ protocol YouTubeProviding {
     func playlist(_ id: String, cancellation: SoundCloudCancellation) throws -> YouTubeCollection
     /// Videos matching words, for when there is no link to paste.
     func searchVideos(_ query: String, cancellation: SoundCloudCancellation) throws -> YouTubeCollection
+    /// Cuts a downloaded video into its chapters; the whole file is removed afterwards.
+    func split(_ file: URL, track: YouTubeTrack, cancellation: SoundCloudCancellation,
+               stage: @escaping (String) -> Void) throws -> [(URL, YouTubeTrack)]
 }
 
 extension YouTubeProviding {
@@ -82,6 +106,10 @@ extension YouTubeProviding {
         throw DropError.message("Поиск YouTube здесь не поддерживается.")
     }
     func preview(_ input: String, cancellation: SoundCloudCancellation) -> YouTubeTrack? { nil }
+    func split(_ file: URL, track: YouTubeTrack, cancellation: SoundCloudCancellation,
+               stage: @escaping (String) -> Void) throws -> [(URL, YouTubeTrack)] {
+        throw DropError.message("Деление на главы здесь не поддерживается.")
+    }
     func download(_ track: YouTubeTrack, directory: URL, cancellation: SoundCloudCancellation,
                   stage: @escaping (String) -> Void, progress: @escaping (Double) -> Void) throws -> URL {
         try download(track, directory: directory, cancellation: cancellation, stage: stage)
@@ -249,9 +277,26 @@ final class YouTubeService: YouTubeProviding {
         let artist = (item["artist"] as? String) ?? (item["artists"] as? [String])?.joined(separator: ", ") ?? (item["creator"] as? String)
         let tags = TrackMetadata.youTube(title: clean(title), channel: clean((item["channel"] as? String) ?? (item["uploader"] as? String) ?? ""),
                                          artist: artist.map(clean), track: (item["track"] as? String).map(clean))
-        return YouTubeTrack(id: expectedID, title: tags.title, artist: tags.artist, duration: item["duration"] as? Double,
+        let duration = (item["duration"] as? NSNumber)?.doubleValue
+        return YouTubeTrack(id: expectedID, title: tags.title, artist: tags.artist, duration: duration,
                             album: (item["album"] as? String).map(clean)?.nonEmpty,
-                            year: TrackMetadata.year(item["release_year"] ?? item["release_date"] ?? item["upload_date"]))
+                            year: TrackMetadata.year(item["release_year"] ?? item["release_date"] ?? item["upload_date"]),
+                            chapters: parseChapters(item["chapters"], duration: duration))
+    }
+
+    /// Two or more ordered chapters of at least a second; anything odd means none.
+    static func parseChapters(_ value: Any?, duration: Double?) -> [YouTubeChapter] {
+        guard let items = value as? [[String: Any]], (2...200).contains(items.count) else { return [] }
+        var chapters: [YouTubeChapter] = []
+        for (index, item) in items.enumerated() {
+            guard let start = (item["start_time"] as? NSNumber)?.doubleValue, var end = (item["end_time"] as? NSNumber)?.doubleValue,
+                  start.isFinite, end.isFinite, start >= 0 else { return [] }
+            if let duration { end = min(end, duration) }
+            guard end - start >= 1, start >= (chapters.last?.end ?? 0) - 0.5 else { return [] }
+            let raw = String(((item["title"] as? String) ?? "").unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) }.prefix(300))
+            chapters.append(YouTubeChapter(title: TrackMetadata.chapterTitle(raw).nonEmpty ?? "Часть \(index + 1)", start: start, end: end))
+        }
+        return chapters
     }
 
     private var arguments: [String] {
@@ -651,6 +696,69 @@ final class YouTubeService: YouTubeProviding {
         arguments += ["-map", "0:a:0"] + codec + ["-fs", "200000001"]
         arguments += tagArguments.outputs
         return arguments + [output.path]
+    }
+
+    /// One chapter as a stream copy; MP3 keeps ID3 v2.3 for older players.
+    static func chapterArguments(source: URL, output: URL, start: Double, length: Double, mp3: Bool, tags: AudioTags, cover: URL?) -> [String] {
+        func time(_ value: Double) -> String { String(format: "%.3f", locale: Locale(identifier: "en_US_POSIX"), value) }
+        let tagArguments = tags.ffmpegArguments(cover: cover)
+        var arguments: [String] = ["-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                                   "-ss", time(start), "-t", time(length), "-i", source.path]
+        arguments += tagArguments.inputs
+        arguments += ["-map", "0:a:0", "-c:a", "copy"]
+        if mp3 { arguments += ["-id3v2_version", "3"] }
+        arguments += tagArguments.outputs
+        return arguments + [output.path]
+    }
+
+    func split(_ file: URL, track: YouTubeTrack, cancellation: SoundCloudCancellation,
+               stage: @escaping (String) -> Void) throws -> [(URL, YouTubeTrack)] {
+        let chapters = track.chapters
+        guard chapters.count >= 2 else { throw DropError.message("У этого видео нет глав.") }
+        let fm = FileManager.default
+        let folder = file.deletingLastPathComponent().appendingPathComponent("Chapters", isDirectory: true)
+        try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+        var finished = false
+        defer { if !finished { try? fm.removeItem(at: folder) } }
+        let mp4 = FileTools.isMP4(file)
+        let cover = artwork.flatMap { $0(CoverArt.youTubeURLs(track.id), cancellation) }
+        let coverFolder = folder.appendingPathComponent(".cover", isDirectory: true)
+        try fm.createDirectory(at: coverFolder, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: coverFolder) }
+        let album = track.album ?? track.title
+        var parts: [(URL, YouTubeTrack)] = []
+        for (index, chapter) in chapters.enumerated() {
+            if cancellation.isCancelled { throw SoundCloudError.cancelled }
+            stage("Делим на главы: \(index + 1) из \(chapters.count)")
+            let names = TrackMetadata.youTube(title: chapter.title, channel: track.artist, artist: nil, track: nil)
+            let part = YouTubeTrack(id: track.id, title: names.title, artist: names.artist, duration: chapter.end - chapter.start,
+                                    album: album, year: track.year,
+                                    part: YouTubeTrackPart(number: index + 1, count: chapters.count, start: chapter.start))
+            let tags = AudioTags(title: part.title, artist: part.artist, album: album, comment: part.url.absoluteString,
+                                 year: track.year, artwork: cover)
+            let output = folder.appendingPathComponent(String(format: "%02d", index + 1) + (mp4 ? ".m4a" : ".mp3"))
+            var done = false
+            if mp4 {
+                do {
+                    try AudioRemux.m4a(from: file, to: output, tags: tags, cancellation: cancellation, range: chapter.start...chapter.end)
+                    done = true
+                } catch {
+                    if cancellation.isCancelled { throw SoundCloudError.cancelled }
+                }
+            }
+            if !done {
+                guard let ffmpeg else { throw DropError.message("Чтобы разделить это видео на главы, нужен FFmpeg (brew install ffmpeg).") }
+                _ = try run(ffmpeg, arguments: Self.chapterArguments(source: file, output: output, start: chapter.start,
+                                                                     length: chapter.end - chapter.start, mp3: !mp4, tags: tags,
+                                                                     cover: tags.coverFile(in: coverFolder)),
+                            cancellation: cancellation, timeout: 300)
+            }
+            try FileTools.validate(output, allowedExtensions: ["mp3", "m4a"])
+            parts.append((output, part))
+        }
+        try? fm.removeItem(at: file)
+        finished = true
+        return parts
     }
 
     static func encodeArguments(source: URL, output: URL, track: YouTubeTrack, tags: AudioTags? = nil, cover: URL? = nil) -> [String] {

@@ -32,12 +32,62 @@ struct ImportEntry: Codable, Identifiable, Equatable {
     var artist: String?
     var duration: Double?
     var playlistError: String?
+    /// Start, end and album position set in Music after the import; the file itself is not cut.
+    var adjustments: TrackAdjustments?
+    var adjustmentError: String?
     var error: String?
 
     var cloudRetryMessage: String? {
         guard cloudSyncPending == true, CloudState.canAutoRetry(cloudStatus), cloudPermissionBlocked != true else { return nil }
         return cloudUpdateError == nil ? "Ждём загрузку в облако · автоматический повтор включён"
             : "Обновление облака в очереди · повторим автоматически"
+    }
+}
+
+/// Properties Music keeps for a track rather than the file: where playback starts and ends,
+/// and its place in an album. A nil start or end means the beginning or the end of the audio.
+struct TrackAdjustments: Codable, Equatable {
+    var start: Double?
+    var finish: Double?
+    var number: Int?
+    var count: Int?
+    var albumArtist: String?
+
+    var isEmpty: Bool { start == nil && finish == nil && number == nil && count == nil && albumArtist == nil }
+    var isTrimmed: Bool { start != nil || finish != nil }
+
+    /// Checks the trim against the track's length; the range must leave at least a second.
+    static func trim(start: Double?, finish: Double?, duration: Double?) throws -> (start: Double?, finish: Double?) {
+        let start = start.flatMap { $0 > 0.05 ? $0 : nil }
+        var finish = finish
+        if let value = finish, let duration, value >= duration - 0.05 { finish = nil }
+        if let start, !start.isFinite || start < 0 { throw DropError.message("Неверное начало.") }
+        if let finish, !finish.isFinite || finish <= 0 { throw DropError.message("Неверный конец.") }
+        if let duration, let start, start >= duration - 1 { throw DropError.message("Начало должно быть раньше конца трека.") }
+        if let start, let finish, finish - start < 1 { throw DropError.message("Конец должен быть хотя бы на секунду позже начала.") }
+        return (start, finish)
+    }
+
+    /// Reads "1:05", "1:02:03", "65" or "65.5"; nil for anything else.
+    static func seconds(_ text: String) -> Double? {
+        let value = text.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: ",", with: ".")
+        guard !value.isEmpty, value.count <= 12 else { return nil }
+        let parts = value.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
+        guard (1...3).contains(parts.count) else { return nil }
+        var total = 0.0
+        for (index, part) in parts.enumerated() {
+            let last = index == parts.count - 1
+            guard !part.isEmpty, part.allSatisfy({ $0.isNumber || (last && $0 == ".") }), let number = Double(part), number >= 0 else { return nil }
+            if index > 0, number >= 60 { return nil }
+            total = total * 60 + number
+        }
+        return total
+    }
+
+    static func label(_ seconds: Double) -> String {
+        let whole = Int(max(0, min(seconds, 864_000)).rounded())
+        return whole >= 3_600 ? String(format: "%d:%02d:%02d", whole / 3_600, whole / 60 % 60, whole % 60)
+                              : String(format: "%d:%02d", whole / 60, whole % 60)
     }
 }
 

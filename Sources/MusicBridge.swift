@@ -137,6 +137,40 @@ enum MusicBridge {
         }
     }
 
+    /// Start and finish are restored to the whole track when they are not set.
+    static func adjustSource(id: String, adjustments: TrackAdjustments) -> String {
+        func number(_ value: Double) -> String { String(format: "%.3f", locale: Locale(identifier: "en_US_POSIX"), value) }
+        // The old range is opened up first, since Music refuses a start after the current finish.
+        var lines = [
+            "set finish of selectedTrack to (duration of selectedTrack)",
+            "set start of selectedTrack to " + (adjustments.start.map(number) ?? "0")
+        ]
+        if let finish = adjustments.finish.map(number) {
+            lines.append("if \(finish) < (duration of selectedTrack) then set finish of selectedTrack to \(finish)")
+        }
+        if let value = adjustments.number { lines.append("set track number of selectedTrack to \(value)") }
+        if let value = adjustments.count { lines.append("set track count of selectedTrack to \(value)") }
+        if let value = adjustments.albumArtist { lines.append("set album artist of selectedTrack to " + FileTools.appleScriptLiteral(value)) }
+        return """
+        with timeout of 30 seconds
+            tell application id "com.apple.Music"
+                set foundTracks to (every track of library playlist 1 whose persistent ID is \(FileTools.appleScriptLiteral(id)))
+                if (count of foundTracks) is 0 then error "Трек не найден в медиатеке" number -1728
+                set selectedTrack to item 1 of foundTracks
+                \(lines.joined(separator: "\n                "))
+                return true
+            end tell
+        end timeout
+        """
+    }
+
+    static func adjust(id: String, adjustments: TrackAdjustments) throws {
+        try ensureRunning()
+        guard try execute(adjustSource(id: id, adjustments: adjustments)).booleanValue else {
+            throw DropError.message("«Музыка» не подтвердила изменение трека.")
+        }
+    }
+
     static let playlistNamesSource = """
     with timeout of 10 seconds
         tell application id "com.apple.Music"

@@ -22,6 +22,9 @@ import Observation
     /// The playlist of a watch link that was opened as a single video.
     private(set) var relatedPlaylistID: String?
     @ObservationIgnored private var playlistTargets: [String: String] = [:]
+    /// Videos to cut into chapters once downloaded, and the album position of each cut track.
+    @ObservationIgnored private var splitRequests: Set<String> = []
+    @ObservationIgnored private var partAdjustments: [String: TrackAdjustments] = [:]
     @ObservationIgnored private var autoAddInput: String?
     private let service: YouTubeProviding
     private let searchQueue = DispatchQueue(label: "tech.musicdrop.youtube.search", qos: .userInitiated, attributes: .concurrent)
@@ -174,6 +177,60 @@ import Observation
         playlistTargets.removeValue(forKey: id)
     }
 
+    /// Where a chapter goes in its album; read once when the track is handed off.
+    func adjustments(for libraryID: String) -> TrackAdjustments? {
+        partAdjustments.removeValue(forKey: libraryID)
+    }
+
+    /// Downloads the video once and adds each chapter as its own track of one album.
+    func addChapters(_ track: YouTubeTrack) {
+        guard !preview else { error = "Это предпросмотр. Добавление в медиатеку отключено."; return }
+        guard track.chapters.count >= 2 else { add(track); return }
+        splitRequests.insert(track.id)
+        add(track)
+    }
+
+    private func deliver(_ file: URL, _ track: YouTubeTrack) {
+        guard splitRequests.remove(track.id) != nil else { onReady?(file, track); return }
+        let token = SoundCloudCancellation()
+        downloadTokens[track.id] = token
+        requested.insert(track.id)
+        downloadErrors[track.id] = nil
+        downloadStates[track.id] = "Делим на главы…"
+        downloadProgress[track.id] = nil
+        onActivity?()
+        downloadQueue.addOperation { [weak self] in
+            guard let self else { return }
+            let result = Result {
+                try self.service.split(file, track: track, cancellation: token, stage: { state in
+                    DispatchQueue.main.async {
+                        if self.downloadTokens[track.id] === token { self.downloadStates[track.id] = state }
+                    }
+                })
+            }
+            DispatchQueue.main.async {
+                guard self.downloadTokens[track.id] === token else { self.discard(file); return }
+                self.downloadTokens[track.id] = nil
+                self.requested.remove(track.id)
+                self.downloadStates[track.id] = nil
+                switch result {
+                case .success(let parts):
+                    for (url, part) in parts {
+                        self.partAdjustments[part.libraryID] = TrackAdjustments(number: part.part?.number, count: part.part?.count,
+                                                                                albumArtist: track.artist)
+                        self.onReady?(url, part)
+                    }
+                case .failure(let error):
+                    self.discard(file)
+                    if !token.isCancelled {
+                        self.downloadErrors[track.id] = "Не удалось разделить на главы: " + error.localizedDescription
+                    }
+                }
+                self.onActivity?()
+            }
+        }
+    }
+
     /// A card whose check failed or was replaced cannot be downloaded reliably.
     private func dropUnverifiedCards() {
         let stale = verifying.filter { downloadTokens[$0] == nil }
@@ -193,7 +250,7 @@ import Observation
             prefetchedIDs.remove(track.id)
             if FileManager.default.fileExists(atPath: file.path) {
                 downloadErrors[track.id] = nil
-                onReady?(file, track)
+                deliver(file, track)
                 onActivity?()
                 return
             }
@@ -252,7 +309,7 @@ import Observation
         switch result {
         case .success(let file):
             if token.isCancelled { discard(file) }
-            else if wanted { onReady?(file, track) }
+            else if wanted { deliver(file, track) }
             else { prefetched[track.id] = file; prefetchedIDs.insert(track.id) }
         case .failure(let error):
             if wanted, !token.isCancelled { downloadErrors[track.id] = error.localizedDescription }
@@ -268,6 +325,7 @@ import Observation
     }
 
     func cancel(_ track: YouTubeTrack) {
+        splitRequests.remove(track.id)
         downloadTokens[track.id]?.cancel()
         downloadTokens[track.id] = nil
         requested.remove(track.id)

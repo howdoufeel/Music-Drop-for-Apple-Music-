@@ -208,9 +208,28 @@ struct SoundCloudPanel: View {
             }
             if model.previewID == track.id, !model.previewLoading {
                 PreviewProgress(player: player, isClip: model.previewIsClip).padding(.leading, 54)
-            } else if let problem = model.previewErrors[track.id] {
+                // A clip's position says nothing about the full track, so only full streams can mark a trim.
+                if !model.previewIsClip, !added, !working {
+                    HStack(spacing: 12) {
+                        Button { model.markTrim(track, start: player.position) } label: { Label("Начало здесь", systemImage: "arrow.right.to.line") }
+                        Button { model.markTrim(track, finish: player.position) } label: { Label("Конец здесь", systemImage: "arrow.left.to.line") }
+                    }
+                    .buttonStyle(.borderless).font(.system(size: 10)).padding(.leading, 54)
+                    .help("Отметь, откуда и докуда «Музыка» будет играть трек")
+                }
+            }
+            if let problem = model.previewErrors[track.id] {
                 Text(problem).font(.system(size: 10)).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true).padding(.leading, 54)
+            }
+            if let trim = model.trims[track.id], !added {
+                HStack(spacing: 8) {
+                    Label("Будет звучать " + TrackAdjustments.label(trim.start ?? 0) + " – "
+                          + (trim.finish.map(TrackAdjustments.label) ?? track.duration.map(TrackAdjustments.label) ?? "конец"),
+                          systemImage: "scissors")
+                    Button("Сбросить") { model.clearTrim(track) }.buttonStyle(.borderless)
+                }
+                .font(.system(size: 10)).foregroundStyle(.secondary).padding(.leading, 54)
             }
             if let state = model.downloadStates[track.id] {
                 DownloadStatus(state: state, progress: model.downloadProgress[track.id]).padding(.leading, 54)

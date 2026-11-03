@@ -3,7 +3,9 @@ import AVFoundation
 /// Rewraps AAC audio into a regular .m4a with Apple's own framework, so the common
 /// SoundCloud and YouTube formats need no FFmpeg. Nothing is re-encoded.
 enum AudioRemux {
-    static func m4a(from source: URL, to output: URL, tags: AudioTags, cancellation: SoundCloudCancellation) throws {
+    /// With `range` (seconds) only that part is written, as when a video is cut into chapters.
+    static func m4a(from source: URL, to output: URL, tags: AudioTags, cancellation: SoundCloudCancellation,
+                    range: ClosedRange<Double>? = nil) throws {
         if cancellation.isCancelled { throw SoundCloudError.cancelled }
         let asset = AVURLAsset(url: source)
         guard let session = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetPassthrough) else {
@@ -12,6 +14,10 @@ enum AudioRemux {
         try? FileManager.default.removeItem(at: output)
         session.outputURL = output
         session.outputFileType = .m4a
+        if let range {
+            session.timeRange = CMTimeRange(start: CMTime(seconds: range.lowerBound, preferredTimescale: 44_100),
+                                            end: CMTime(seconds: range.upperBound, preferredTimescale: 44_100))
+        }
         var metadata = [
             item(.commonIdentifierTitle, tags.title),
             item(.commonIdentifierArtist, tags.artist),

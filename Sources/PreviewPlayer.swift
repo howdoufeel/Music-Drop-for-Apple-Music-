@@ -39,6 +39,9 @@ import Observation
         isBuffering = true
     }
 
+    /// The listening position in seconds.
+    var position: Double { duration * progress }
+
     func toggle() {
         guard player.currentItem != nil else { return }
         if isPlaying { player.pause() } else { player.play() }
