@@ -47,7 +47,9 @@ import Observation
     @ObservationIgnored var shouldPrefetch: ((YouTubeTrack) -> Bool)?
     var isDownloading: Bool { !downloadStates.isEmpty }
 
-    init(service: YouTubeProviding = YouTubeService(artwork: CoverArt.load), directory: URL? = nil, preview: Bool = false, prefetch: Bool = true) {
+    init(service: YouTubeProviding = YouTubeService(artwork: CoverArt.load,
+                                                    onExtractorFailure: { ExtractorUpdater.shared.checkIfDue(interval: 6 * 3_600) }),
+         directory: URL? = nil, preview: Bool = false, prefetch: Bool = true) {
         self.service = service
         self.preview = preview
         self.prefetch = prefetch

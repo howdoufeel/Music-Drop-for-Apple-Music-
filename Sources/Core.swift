@@ -86,6 +86,12 @@ enum FileTools {
         }
     }
 
+    static func digest(_ data: Data) -> String {
+        var hash = SHA256()
+        hash.update(data: data)
+        return hash.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
     static func digest(_ url: URL) throws -> String {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
@@ -141,6 +147,7 @@ enum FileTools {
     /// yt-dlp ships unpacked, so it starts without extracting itself to a temporary folder on every run.
     /// A single-file build from an older installer is still accepted.
     static func extractor(in resources: URL) -> URL {
+        if let updated = ExtractorUpdater.shared.activeExtractor { return updated }
         let folder = resources.appendingPathComponent("Helpers/yt-dlp", isDirectory: true)
         var isDirectory: ObjCBool = false
         if FileManager.default.fileExists(atPath: folder.path, isDirectory: &isDirectory), !isDirectory.boolValue {

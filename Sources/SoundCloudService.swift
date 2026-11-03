@@ -89,7 +89,9 @@ extension SoundCloudProviding {
 }
 
 final class SoundCloudService: SoundCloudProviding {
-    let helper: URL
+    /// Resolved on every use, so an updated yt-dlp applies without restarting.
+    var helper: URL { helperOverride ?? FileTools.extractor(in: Bundle.main.resourceURL ?? Bundle.main.bundleURL) }
+    private let helperOverride: URL?
     let ffmpeg: URL?
     let cache: URL
     private let searchClient: SoundCloudSearchClient
@@ -104,7 +106,7 @@ final class SoundCloudService: SoundCloudProviding {
          searchClient: SoundCloudSearchClient? = nil, now: @escaping () -> Date = Date.init,
          artwork: (([URL], SoundCloudCancellation) -> Data?)? = nil) {
         self.artwork = artwork
-        self.helper = helper ?? FileTools.extractor(in: Bundle.main.resourceURL ?? Bundle.main.bundleURL)
+        self.helperOverride = helper
         self.ffmpeg = FileTools.ffmpeg(ffmpeg)
         self.cache = cache ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Music Drop/Cache/SoundCloud", isDirectory: true)

@@ -117,6 +117,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
             return event
         }
         if !pendingURLs.isEmpty { store.accept(pendingURLs); pendingURLs.removeAll() }
+        // YouTube changes often outpace app releases; a newer yt-dlp is fetched in the background.
+        if !preview { ExtractorUpdater.shared.checkIfDue() }
         showWindow()
         if !preview { UserDefaults.standard.set(true, forKey: "didShowWelcome") }
     }

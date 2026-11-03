@@ -1699,6 +1699,73 @@ let limitedFile = root.appendingPathComponent("limited.m4a")
 do { _ = try YouTubeHTTPTransfer.run(credentialRequest,cancellation:SoundCloudCancellation(),maximumBytes:100,destination:limitedFile,endpoint:relayEndpoint,configuration:httpFixtureConfig);fatalError("Rate limit accepted") }
 catch { expect((error as? YouTubeHTTPError)?.status == 429 && !FileManager.default.fileExists(atPath:limitedFile.path),"rate limits stop the transfer and never save an error page as audio") }
 
+// yt-dlp updates: the newest official release, checked and run once before it is used.
+expect(ExtractorUpdater.isVersion("2026.10.26") && ExtractorUpdater.isVersion("2026.10.26.1") && !ExtractorUpdater.isVersion("latest")
+       && ExtractorUpdater.isNewer("2026.11.02", than: "2026.10.26") && ExtractorUpdater.isNewer("2026.10.26.1", than: "2026.10.26")
+       && !ExtractorUpdater.isNewer("2026.10.26", than: "2026.10.26") && !ExtractorUpdater.isNewer("2026.09.30", than: "2026.10.26"),
+       "yt-dlp versions are dates compared part by part")
+let fakeHash = String(repeating: "ab", count: 32)
+expect(ExtractorUpdater.checksum(of: "yt-dlp_macos.zip", in: "\(String(repeating: "0", count: 64))  yt-dlp_macos\n\(fakeHash)  yt-dlp_macos.zip\n") == fakeHash
+       && ExtractorUpdater.checksum(of: "yt-dlp_macos.zip", in: "short  yt-dlp_macos.zip") == nil,
+       "only a full SHA-256 line for the macOS archive is accepted")
+func fakeRelease(_ name: String, reports version: String) throws -> Data {
+    let folder = root.appendingPathComponent(name, isDirectory: true)
+    try FileManager.default.createDirectory(at: folder.appendingPathComponent("_internal"), withIntermediateDirectories: true)
+    try Data("library".utf8).write(to: folder.appendingPathComponent("_internal/Python"))
+    let executable = folder.appendingPathComponent("yt-dlp_macos")
+    try "#!/bin/sh\necho \(version)\n".write(to: executable, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+    let zipper = Process()
+    zipper.executableURL = URL(fileURLWithPath: "/usr/bin/zip")
+    zipper.currentDirectoryURL = folder
+    zipper.arguments = ["-q", "-r", "release.zip", "yt-dlp_macos", "_internal"]
+    try zipper.run(); zipper.waitUntilExit()
+    return try Data(contentsOf: folder.appendingPathComponent("release.zip"))
+}
+func releaseFetch(tag: String, archive: Data, sum: String? = nil, log: @escaping (URL) -> Void = { _ in }) -> ExtractorUpdater.Fetch {
+    { url, _ in
+        log(url)
+        switch url.lastPathComponent {
+        case "latest": return try JSONSerialization.data(withJSONObject: ["tag_name": tag])
+        case "SHA2-256SUMS": return Data("\(sum ?? FileTools.digest(archive))  yt-dlp_macos.zip\n".utf8)
+        case "yt-dlp_macos.zip": return archive
+        default: throw DropError.message("unexpected \(url)")
+        }
+    }
+}
+let updateDefaults = UserDefaults(suiteName: "musicdrop-updates-" + UUID().uuidString)!
+let goodRelease = try fakeRelease("ReleaseGood", reports: "2026.11.02")
+var updateRequests: [URL] = []
+let updaterRoot = root.appendingPathComponent("UpdatedExtractor")
+let updater = ExtractorUpdater(root: updaterRoot, bundledVersion: "2026.10.26",
+                               fetch: releaseFetch(tag: "2026.11.02", archive: goodRelease, log: { updateRequests.append($0) }), defaults: updateDefaults)
+expect(updater.activeExtractor == nil && updater.activeVersion == "2026.10.26", "the app's own yt-dlp is used until an update is installed")
+expect(try! updater.update() == .updated("2026.11.02") && updater.activeVersion == "2026.11.02"
+       && updater.activeExtractor?.path.hasSuffix("2026.11.02/yt-dlp_macos") == true
+       && FileManager.default.fileExists(atPath: updaterRoot.appendingPathComponent("2026.11.02/_internal/Python").path),
+       "a newer release is verified, unpacked with its libraries and becomes the active extractor")
+expect(updateRequests.map(\.host) == ["api.github.com", "github.com", "github.com"]
+       && updateRequests[2].absoluteString == "https://github.com/yt-dlp/yt-dlp/releases/download/2026.11.02/yt-dlp_macos.zip",
+       "updates come only from yt-dlp's official GitHub release")
+expect(try! updater.update() == .upToDate("2026.11.02"), "a second check finds nothing newer and downloads nothing")
+let tampered = ExtractorUpdater(root: root.appendingPathComponent("TamperedExtractor"), bundledVersion: "2026.10.26",
+                                fetch: releaseFetch(tag: "2026.11.03", archive: goodRelease, sum: fakeHash), defaults: updateDefaults)
+do { _ = try tampered.update(); fatalError("Tampered release installed") }
+catch { expect(tampered.activeExtractor == nil && error.localizedDescription.contains("контрольной"), "an archive that does not match the release checksum is refused") }
+let mislabeled = ExtractorUpdater(root: root.appendingPathComponent("MislabeledExtractor"), bundledVersion: "2026.10.26",
+                                  fetch: releaseFetch(tag: "2026.11.04", archive: try fakeRelease("ReleaseWrong", reports: "1999.01.01")), defaults: updateDefaults)
+do { _ = try mislabeled.update(); fatalError("Mislabeled release installed") }
+catch { expect(mislabeled.activeExtractor == nil, "an extractor that does not report its release is never used") }
+let newerApp = ExtractorUpdater(root: updaterRoot, bundledVersion: "2027.01.01", fetch: releaseFetch(tag: "2026.11.02", archive: goodRelease), defaults: updateDefaults)
+expect(newerApp.activeExtractor == nil && newerApp.activeVersion == "2027.01.01", "a newer yt-dlp inside the app wins over an older download")
+updateRequests = []
+updateDefaults.set(Date(), forKey: ExtractorUpdater.lastCheckKey)
+updater.checkIfDue()
+RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+expect(updateRequests.isEmpty, "automatic checks wait a day between runs")
+updater.revert()
+expect(updater.activeExtractor == nil && updater.activeVersion == "2026.10.26", "reverting returns to the app's own yt-dlp")
+
 // Upload titles become the title and artist a library expects.
 let vevo = TrackMetadata.youTube(title: "Daft Punk - Get Lucky (Official Video) [4K]", channel: "DaftPunkVEVO", artist: nil, track: nil)
 expect(vevo.title == "Get Lucky" && vevo.artist == "Daft Punk", "an 'Artist - Song (Official Video) [4K]' upload is split and cleaned")

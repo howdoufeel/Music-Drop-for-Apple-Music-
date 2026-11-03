@@ -127,6 +127,7 @@ struct DropPanel: View {
     @AppStorage(YouTubeAudioFormat.defaultsKey) private var youtubeFormat: YouTubeAudioFormat = .m4a
     @AppStorage(YouTubeFallbackRace.defaultsKey) private var raceFallback = true
     @State private var fileTargeted = false
+    @State private var extractor = ExtractorUpdateModel()
     @State private var creatingPlaylist = false
     @State private var newPlaylistName = ""
 
@@ -328,6 +329,24 @@ struct DropPanel: View {
             .pickerStyle(.menu).controlSize(.small).font(.system(size: 12))
             Toggle("Резервный сервис, если YouTube медлит дольше 5 с", isOn: $raceFallback)
                 .toggleStyle(.switch).controlSize(.small).font(.system(size: 12))
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("Компонент YouTube: yt-dlp " + (extractor.version ?? "—")).font(.system(size: 12))
+                    Spacer()
+                    if extractor.checking { ProgressView().controlSize(.mini) }
+                    Button("Проверить обновление") { extractor.check() }.disabled(extractor.checking)
+                        .buttonStyle(.borderless).font(.system(size: 11))
+                }
+                if let status = extractor.status {
+                    Text(status).font(.system(size: 10)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+                Toggle("Обновлять автоматически", isOn: Binding(get: { extractor.automatic }, set: { extractor.setAutomatic($0) }))
+                    .toggleStyle(.switch).controlSize(.small).font(.system(size: 11))
+                if extractor.usesDownloadedVersion {
+                    Button("Вернуть версию из приложения") { extractor.revert() }.buttonStyle(.borderless).font(.system(size: 11))
+                }
+            }
+            .onAppear { extractor.refresh() }
             HStack {
                 Button("Открыть «Музыку»") { store.openMusic() }
                 Spacer()

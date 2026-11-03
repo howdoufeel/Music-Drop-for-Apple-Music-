@@ -82,7 +82,9 @@ extension YouTubeProviding {
 }
 
 final class YouTubeService: YouTubeProviding {
-    let helper: URL
+    /// Resolved on every use, so an updated yt-dlp applies without restarting.
+    var helper: URL { helperOverride ?? FileTools.extractor(in: Bundle.main.resourceURL ?? Bundle.main.bundleURL) }
+    private let helperOverride: URL?
     let ffmpeg: URL?
     let runtime: URL
     let cache: URL
@@ -95,19 +97,22 @@ final class YouTubeService: YouTubeProviding {
     private let transferConfiguration: URLSessionConfiguration?
     private let raceDelay: () -> TimeInterval?
     private let artwork: (([URL], SoundCloudCancellation) -> Data?)?
+    private let onExtractorFailure: (() -> Void)?
     /// `artwork` loads cover art for tagging; without it files get no picture.
+    /// `onExtractorFailure` hears about yt-dlp failures, which often mean it needs an update.
     init(helper: URL? = nil, ffmpeg: URL? = nil, runtime: URL? = nil, cache: URL? = nil,
          fallback: YouTubeFallback? = YouTubeFallback(), format: @escaping () -> YouTubeAudioFormat = { .stored },
          transferConfiguration: URLSessionConfiguration? = nil,
          raceDelay: @escaping () -> TimeInterval? = { YouTubeFallbackRace.storedDelay },
-         artwork: (([URL], SoundCloudCancellation) -> Data?)? = nil) {
+         artwork: (([URL], SoundCloudCancellation) -> Data?)? = nil, onExtractorFailure: (() -> Void)? = nil) {
         self.artwork = artwork
+        self.onExtractorFailure = onExtractorFailure
         self.fallback = fallback
         self.format = format
         self.transferConfiguration = transferConfiguration
         self.raceDelay = raceDelay
         let resources = Bundle.main.resourceURL ?? Bundle.main.bundleURL
-        self.helper = helper ?? FileTools.extractor(in: resources)
+        self.helperOverride = helper
         self.ffmpeg = FileTools.ffmpeg(ffmpeg)
         #if arch(arm64)
         let runtimeName = "deno-arm64"
@@ -391,10 +396,16 @@ final class YouTubeService: YouTubeProviding {
                 group.leave()
             }
             try validateTools(needsEncoder: false)
-            let data = try run(helper, arguments: arguments + ["-f", format.selector, "--skip-download", "--dump-single-json",
-                                                             "--", "https://www.youtube.com/watch?v=" + id],
-                               cancellation: cancellation, timeout: 30)
-            let info = try Self.parseInfo(data, expectedID: id)
+            let info: YouTubeMediaInfo
+            do {
+                let data = try run(helper, arguments: arguments + ["-f", format.selector, "--skip-download", "--dump-single-json",
+                                                                 "--", "https://www.youtube.com/watch?v=" + id],
+                                   cancellation: cancellation, timeout: 30)
+                info = try Self.parseInfo(data, expectedID: id)
+            } catch {
+                if !cancellation.isCancelled { onExtractorFailure?() }
+                throw error
+            }
             routeLock.lock()
             infos = infos.filter { Date().timeIntervalSince($0.value.date) < 1_800 }
             if infos.count >= 30, let oldest = infos.min(by: { $0.value.date < $1.value.date })?.key { infos[oldest] = nil }
