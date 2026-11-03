@@ -72,9 +72,14 @@ protocol SoundCloudProviding {
     func prewarm()
     /// A stream to listen to before adding; nil when SoundCloud offers nothing playable.
     func previewStream(for track: SoundCloudTrack, cancellation: SoundCloudCancellation) throws -> SoundCloudPreview?
+    /// The tracks of a set link accepted by `collectionTarget`.
+    func collection(_ link: URL, cancellation: SoundCloudCancellation) throws -> SoundCloudCollection
 }
 
 extension SoundCloudProviding {
+    func collection(_ link: URL, cancellation: SoundCloudCancellation) throws -> SoundCloudCollection {
+        throw SoundCloudError.message("Сеты SoundCloud здесь не поддерживаются.")
+    }
     func previewStream(for track: SoundCloudTrack, cancellation: SoundCloudCancellation) throws -> SoundCloudPreview? { nil }
     func download(_ track: SoundCloudTrack, directory: URL, cancellation: SoundCloudCancellation,
                   stage: @escaping (String) -> Void, progress: @escaping (Double) -> Void) throws -> URL {
@@ -198,6 +203,27 @@ final class SoundCloudService: SoundCloudProviding {
 
     func previewStream(for track: SoundCloudTrack, cancellation: SoundCloudCancellation) throws -> SoundCloudPreview? {
         try searchClient.previewStream(for: track, cancellation: cancellation)
+    }
+
+    func collection(_ link: URL, cancellation: SoundCloudCancellation) throws -> SoundCloudCollection {
+        try searchClient.collection(link, cancellation: cancellation)
+    }
+
+    /// A set or album link: soundcloud.com/<artist>/sets/<name>. Anything else returns nil.
+    static func collectionTarget(_ input: String) -> URL? {
+        let value = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard value.count <= 2_000, !value.contains("\0"), var components = URLComponents(string: value),
+              ["https", "http"].contains(components.scheme?.lowercased() ?? ""),
+              ["soundcloud.com", "www.soundcloud.com", "m.soundcloud.com"].contains(components.host?.lowercased() ?? ""),
+              components.user == nil, components.password == nil, components.port == nil || components.port == 443 else { return nil }
+        let path = components.path.split(separator: "/")
+        // A private set carries its share token as a fourth path part.
+        guard path.count == 3 || (path.count == 4 && path[3].hasPrefix("s-")), path[1] == "sets" else { return nil }
+        components.scheme = "https"
+        components.host = "soundcloud.com"
+        components.query = nil
+        components.fragment = nil
+        return components.url
     }
 
     func prewarm() {

@@ -11,7 +11,7 @@ struct SoundCloudPanel: View {
     var body: some View {
         VStack(spacing: 12) {
             HStack(spacing: 7) {
-                TextField("Название, автор или ссылка", text: $model.query)
+                TextField("Название, автор, ссылка на трек или сет", text: $model.query)
                     .textFieldStyle(.roundedBorder)
                     .focused($searchFocused)
                     .onSubmit(submit)
@@ -42,7 +42,19 @@ struct SoundCloudPanel: View {
             }
             ScrollView {
                 LazyVStack(spacing: 0) {
-                    if model.results.isEmpty, !model.isSearching, model.error == nil {
+                    if let collection = model.collection {
+                        collectionHeader(collection).padding(.bottom, 8)
+                        ForEach(collection.tracks) { track in
+                            HStack(alignment: .top, spacing: 6) {
+                                Toggle("", isOn: selected(track)).toggleStyle(.checkbox).labelsHidden().padding(.top, 26)
+                                    .disabled(imports.entry(soundCloudID: track.id)?.stage == .imported)
+                                    .accessibilityLabel("Выбрать \(track.title)")
+                                trackRow(track)
+                            }
+                            if track.id != collection.tracks.last?.id { Divider().padding(.leading, 76) }
+                        }
+                    }
+                    if model.collection == nil, model.results.isEmpty, !model.isSearching, model.error == nil {
                         VStack(spacing: 10) {
                             Image(systemName: "waveform").font(.system(size: 32, weight: .light)).foregroundStyle(.orange)
                             Text(model.didSearch ? "Ничего не найдено" : "Найди новый трек")
@@ -52,9 +64,11 @@ struct SoundCloudPanel: View {
                         }
                         .frame(maxWidth: .infinity).padding(.vertical, 60)
                     }
-                    ForEach(model.results) { track in
-                        trackRow(track)
-                        if track.id != model.results.last?.id { Divider().padding(.leading, 54) }
+                    if model.collection == nil {
+                        ForEach(model.results) { track in
+                            trackRow(track)
+                            if track.id != model.results.last?.id { Divider().padding(.leading, 54) }
+                        }
                     }
                 }.padding(.horizontal, 20).padding(.bottom, 16)
             }
@@ -65,6 +79,37 @@ struct SoundCloudPanel: View {
     private func submit() {
         if case .youTube? = LinkRoute.detect(model.query) { navigation.open(.youTube(model.query)) }
         else { model.search() }
+    }
+
+    private func selected(_ track: SoundCloudTrack) -> Binding<Bool> {
+        Binding(get: { model.selection.contains(track.id) },
+                set: { if $0 { model.selection.insert(track.id) } else { model.selection.remove(track.id) } })
+    }
+
+    private func collectionHeader(_ collection: SoundCloudCollection) -> some View {
+        let entries = collection.tracks.map { imports.entry(soundCloudID: $0.id) }
+        let added = entries.filter { $0?.stage == .imported }.count
+        let importing = entries.filter { $0?.stage == .queued || $0?.stage == .importing }.count
+        let downloading = collection.tracks.filter { model.downloadStates[$0.id] != nil }.count
+        return CollectionHeader(title: collection.title, subtitle: collection.artist, artwork: collection.artwork,
+                                symbol: "square.stack", tint: .orange, total: collection.tracks.count,
+                                selected: model.selection.intersection(collection.tracks.map(\.id)).count,
+                                added: added, inFlight: importing + downloading, intoPlaylist: $model.collectionIntoPlaylist,
+                                selectAll: { model.selection = Set(collection.tracks.filter { imports.entry(soundCloudID: $0.id)?.stage != .imported }.map(\.id)) },
+                                selectNone: { model.selection = [] },
+                                add: { addCollection(collection) },
+                                close: { model.closeCollection() })
+        .onAppear { model.selection.subtract(collection.tracks.filter { imports.entry(soundCloudID: $0.id)?.stage == .imported }.map(\.id)) }
+    }
+
+    /// Tracks already in the library are not downloaded again but still join the set's playlist.
+    private func addCollection(_ collection: SoundCloudCollection) {
+        let imported = Set(collection.tracks.filter { imports.entry(soundCloudID: $0.id)?.stage == .imported }.map(\.id))
+        let existing = model.addCollection(skipping: imported)
+        guard model.collectionIntoPlaylist else { return }
+        for track in existing {
+            if let entry = imports.entry(soundCloudID: track.id) { imports.addToPlaylist(entry, playlist: collection.title) }
+        }
     }
 
     /// Play and pause sit on the artwork, so every result can be heard without leaving the list.

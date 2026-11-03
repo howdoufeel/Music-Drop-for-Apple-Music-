@@ -57,6 +57,66 @@ struct DownloadStatus: View {
     }
 }
 
+/// Header of an opened set or playlist: what it holds, how much is chosen and one button for all of it.
+struct CollectionHeader: View {
+    let title: String
+    let subtitle: String
+    let artwork: URL?
+    let symbol: String
+    let tint: Color
+    let total: Int
+    let selected: Int
+    let added: Int
+    let inFlight: Int
+    @Binding var intoPlaylist: Bool
+    let selectAll: () -> Void
+    let selectNone: () -> Void
+    let add: () -> Void
+    let close: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 10) {
+                ArtworkView(url: artwork, symbol: symbol, tint: tint)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(title).font(.system(size: 13, weight: .semibold)).lineLimit(2)
+                    Text(subtitle).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+                    Text(summary).font(.system(size: 10)).foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 0)
+                Button(action: close) { Image(systemName: "xmark.circle.fill") }
+                    .buttonStyle(.borderless).foregroundStyle(.secondary)
+                    .help("Закрыть").accessibilityLabel("Закрыть «\(title)»")
+            }
+            Toggle("Добавить в плейлист «\(title)»", isOn: $intoPlaylist).toggleStyle(.checkbox).font(.system(size: 11))
+            HStack(spacing: 12) {
+                Button("Выбрать все", action: selectAll).buttonStyle(.borderless).disabled(selected == total)
+                Button("Снять все", action: selectNone).buttonStyle(.borderless).disabled(selected == 0)
+                Spacer()
+                Button(action: add) { Text(selected == 0 ? "Ничего не выбрано" : "Добавить \(selected)") }
+                    .buttonStyle(.borderedProminent).tint(tint).disabled(selected == 0)
+                    .accessibilityLabel("Добавить выбранные: \(selected)")
+            }
+            .font(.system(size: 11))
+        }
+        .padding(12)
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.5), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private var summary: String {
+        var parts = [Self.tracks(total)]
+        if added > 0 { parts.append("в медиатеке: \(added)") }
+        if inFlight > 0 { parts.append("добавляется: \(inFlight)") }
+        return parts.joined(separator: " · ")
+    }
+
+    static func tracks(_ count: Int) -> String {
+        let tens = count % 100, ones = count % 10
+        let word = (11...14).contains(tens) ? "треков" : ones == 1 ? "трек" : (2...4).contains(ones) ? "трека" : "треков"
+        return "\(count) \(word)"
+    }
+}
+
 struct DropPanel: View {
     var store: ImportStore
     var soundCloud: SoundCloudStore

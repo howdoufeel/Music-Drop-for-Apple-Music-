@@ -6,6 +6,15 @@ struct SoundCloudAudioSource {
     var isHLS = false
 }
 
+/// A SoundCloud set opened for adding several tracks at once.
+struct SoundCloudCollection: Equatable {
+    let title: String
+    let artist: String
+    let url: URL
+    let artwork: URL?
+    var tracks: [SoundCloudTrack]
+}
+
 /// A stream for listening in the app; `isClip` marks SoundCloud's 30-second preview of a restricted track.
 struct SoundCloudPreview: Equatable {
     let url: URL
@@ -343,7 +352,64 @@ final class SoundCloudSearchClient {
         if let collection = root["collection"] as? [[String: Any]] { items = collection }
         else if root["kind"] as? String == "track" { items = [root] }
         else { throw SoundCloudError.message("Вставь ссылку на отдельный трек SoundCloud.") }
-        let normalized: [[String: Any]] = items.prefix(15).compactMap { item in
+        return try tracks(items, limit: 15)
+    }
+
+    /// Opens a set: SoundCloud sends full objects for its first tracks and only IDs for the
+    /// rest, which are fetched fifty at a time and put back in the set's order.
+    func collection(_ link: URL, cancellation: SoundCloudCancellation) throws -> SoundCloudCollection {
+        for attempt in 0...1 {
+            let clientID = try credential(refresh: attempt > 0, cancellation: cancellation)
+            var components = URLComponents(string: "https://api-v2.soundcloud.com/resolve")!
+            components.queryItems = [URLQueryItem(name: "url", value: link.absoluteString), URLQueryItem(name: "client_id", value: clientID)]
+            let (data, response) = try request(components.url!, cancellation: cancellation)
+            if [401, 403].contains(response.statusCode), attempt == 0 { continue }
+            if response.statusCode == 429 { throw SoundCloudError.rateLimited }
+            guard response.statusCode == 200, data.count <= 20_000_000,
+                  let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+                throw SoundCloudError.message("SoundCloud не открыл этот сет (\(response.statusCode)).")
+            }
+            guard root["kind"] as? String == "playlist" else { throw SoundCloudError.message("Это ссылка не на сет SoundCloud.") }
+            let listed = (root["tracks"] as? [[String: Any]] ?? []).prefix(500)
+            let order = listed.compactMap { ($0["id"] as? NSNumber)?.stringValue ?? $0["id"] as? String }
+            var byID: [String: [String: Any]] = [:]
+            for item in listed where item["title"] != nil {
+                if let id = (item["id"] as? NSNumber)?.stringValue ?? item["id"] as? String { byID[id] = item }
+            }
+            let missing = order.filter { byID[$0] == nil }
+            for start in stride(from: 0, to: missing.count, by: 50) {
+                if cancellation.isCancelled { throw SoundCloudError.cancelled }
+                var batch = URLComponents(string: "https://api-v2.soundcloud.com/tracks")!
+                batch.queryItems = [URLQueryItem(name: "ids", value: missing[start..<min(missing.count, start + 50)].joined(separator: ",")),
+                                    URLQueryItem(name: "client_id", value: clientID)]
+                let (batchData, batchResponse) = try request(batch.url!, cancellation: cancellation)
+                if batchResponse.statusCode == 429 { throw SoundCloudError.rateLimited }
+                guard batchResponse.statusCode == 200,
+                      let items = (try? JSONSerialization.jsonObject(with: batchData)) as? [[String: Any]] else { continue }
+                for item in items {
+                    if let id = (item["id"] as? NSNumber)?.stringValue ?? item["id"] as? String { byID[id] = item }
+                }
+            }
+            let user = root["user"] as? [String: Any] ?? [:]
+            let title = (root["title"] as? String)?.nonEmpty ?? "Сет SoundCloud"
+            // Albums and EPs name the release; a playlist of singles keeps each track's own.
+            let isRelease = ["album", "ep", "single", "compilation"].contains(root["set_type"] as? String ?? "")
+            let tracks = try Self.tracks(order.compactMap { byID[$0] }, limit: 500).map { track -> SoundCloudTrack in
+                var track = track
+                if isRelease, track.album == nil { track.album = title }
+                return track
+            }
+            guard !tracks.isEmpty else { throw SoundCloudError.message("В этом сете нет доступных треков.") }
+            let artwork = (root["artwork_url"] as? String).flatMap(URL.init(string:)).flatMap { CoverArt.isAllowed($0) ? $0 : nil }
+            return SoundCloudCollection(title: title, artist: (user["username"] as? String)?.nonEmpty ?? "SoundCloud",
+                                        url: link, artwork: artwork ?? tracks.first?.artwork, tracks: tracks)
+        }
+        throw SoundCloudError.message("Не удалось открыть сет SoundCloud. Попробуй позже.")
+    }
+
+    /// Track objects from search, a set or a batch lookup, normalized the same way.
+    static func tracks(_ items: [[String: Any]], limit: Int) throws -> [SoundCloudTrack] {
+        let normalized: [[String: Any]] = items.prefix(limit).compactMap { item in
             guard item["kind"] as? String == "track" else { return nil }
             let user = item["user"] as? [String: Any] ?? [:]
             let publisher = item["publisher_metadata"] as? [String: Any] ?? [:]
@@ -359,7 +425,7 @@ final class SoundCloudSearchClient {
             return track
         }
         var hints: [String: SoundCloudStreamHint] = [:]
-        for item in items.prefix(15) where item["kind"] as? String == "track" {
+        for item in items.prefix(limit) where item["kind"] as? String == "track" {
             let id = (item["id"] as? NSNumber)?.stringValue ?? item["id"] as? String ?? ""
             guard let candidate = nativeCandidate(item) else { continue }
             hints[id] = SoundCloudStreamHint(transcoding: candidate.url, fileExtension: candidate.fileExtension,

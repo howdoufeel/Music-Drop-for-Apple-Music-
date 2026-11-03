@@ -65,6 +65,31 @@ final class YouTubeFallback {
         }
         throw DropError.message("Резервный сервис не предоставил аудио.")
     }
+    /// The first page of a playlist, enough for albums and most mixes.
+    func playlist(_ id: String, cancellation: SoundCloudCancellation) throws -> YouTubeCollection {
+        guard YouTubeService.playlistID("https://www.youtube.com/playlist?list=" + id) == id else {
+            throw DropError.message("Неверный идентификатор плейлиста.")
+        }
+        let data = try transport(Self.request(endpoint.appendingPathComponent("api/v1/playlists/" + id)), cancellation, 5_000_000, nil)
+        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw DropError.message("Резервный сервис не открыл этот плейлист.")
+        }
+        func clean(_ text: String) -> String {
+            String(text.unicodeScalars.map { CharacterSet.controlCharacters.contains($0) ? " " : String($0) }.joined()
+                .trimmingCharacters(in: .whitespacesAndNewlines).prefix(400))
+        }
+        var seen: Set<String> = []
+        let tracks: [YouTubeTrack] = (root["videos"] as? [[String: Any]] ?? []).prefix(500).compactMap { video in
+            guard let videoID = video["videoId"] as? String, (try? YouTubeService.videoID("https://youtu.be/" + videoID)) == videoID,
+                  seen.insert(videoID).inserted, let title = video["title"] as? String, !title.isEmpty else { return nil }
+            let tags = TrackMetadata.youTube(title: clean(title), channel: clean(video["author"] as? String ?? ""), artist: nil, track: nil)
+            return YouTubeTrack(id: videoID, title: tags.title, artist: tags.artist, duration: video["lengthSeconds"] as? Double)
+        }
+        guard !tracks.isEmpty else { throw DropError.message("В этом плейлисте нет доступных видео.") }
+        return YouTubeCollection(id: id, title: clean(root["title"] as? String ?? "Плейлист YouTube"),
+                                 author: clean(root["author"] as? String ?? "YouTube"), tracks: tracks)
+    }
+
     static func request(_ url: URL) -> URLRequest {
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 20)
         request.setValue("MusicDrop/1.5.1", forHTTPHeaderField: "User-Agent")

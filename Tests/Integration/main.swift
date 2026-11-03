@@ -1111,6 +1111,69 @@ final class ParallelDownloadFixture: SoundCloudProviding {
         return directory.appendingPathComponent(track.id+".m4a")
     }
 }
+// Whole SoundCloud sets: full objects first, the rest fetched by ID and kept in order.
+expect(SoundCloudService.collectionTarget("https://soundcloud.com/artist/sets/album?si=1")?.absoluteString == "https://soundcloud.com/artist/sets/album"
+       && SoundCloudService.collectionTarget("https://soundcloud.com/artist/sets/private/s-AbC")?.path == "/artist/sets/private/s-AbC"
+       && SoundCloudService.collectionTarget("https://soundcloud.com/artist/song") == nil
+       && SoundCloudService.collectionTarget("https://soundcloud.com.evil.test/artist/sets/album") == nil,
+       "only SoundCloud set links open as sets")
+func setTrack(_ id: Int, full: Bool) -> [String: Any] {
+    guard full else { return ["id": id, "kind": "track"] }
+    var item = nativeTrack
+    item["id"] = id; item["title"] = "Трек \(id)"; item["permalink_url"] = "https://soundcloud.com/artist/track-\(id)"
+    return item
+}
+var setRequests: [URL] = []
+let setClient = SoundCloudSearchClient(cache: nativeCache, clientID: String(repeating:"a",count:32)) { request, _ in
+    let url = request.url!
+    setRequests.append(url)
+    if url.path == "/resolve" {
+        let body: [String: Any] = ["kind": "playlist", "title": "Альбом года", "set_type": "album", "user": ["username": "Группа"],
+                                   "tracks": [setTrack(1, full: true), setTrack(2, full: true), setTrack(3, full: false), setTrack(4, full: false), setTrack(5, full: false)]]
+        return (try JSONSerialization.data(withJSONObject: body), HTTPURLResponse(url:url,statusCode:200,httpVersion:nil,headerFields:nil)!)
+    }
+    let ids = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "ids" }?.value ?? ""
+    let items = ids.split(separator: ",").compactMap { Int($0) }.reversed().map { setTrack($0, full: true) }
+    return (try JSONSerialization.data(withJSONObject: items), HTTPURLResponse(url:url,statusCode:200,httpVersion:nil,headerFields:nil)!)
+}
+let openedSet = try setClient.collection(URL(string: "https://soundcloud.com/group/sets/album")!, cancellation: SoundCloudCancellation())
+expect(openedSet.tracks.map(\.id) == ["1", "2", "3", "4", "5"] && openedSet.title == "Альбом года" && openedSet.artist == "Группа",
+       "a set lists every track in its own order, including those sent only as IDs")
+expect(setRequests.count == 2 && setRequests[1].path == "/tracks" && openedSet.tracks.allSatisfy { $0.album == "Альбом года" },
+       "missing tracks are fetched in one batch and an album names their release")
+
+final class CollectionFixture: SoundCloudProviding {
+    func search(_ input: String, cancellation: SoundCloudCancellation) throws -> [SoundCloudTrack] { [] }
+    func download(_ track: SoundCloudTrack, directory: URL, cancellation: SoundCloudCancellation, stage: @escaping (String) -> Void) throws -> URL {
+        Thread.sleep(forTimeInterval: 0.02)
+        return directory.appendingPathComponent(track.id + ".m4a")
+    }
+    func collection(_ link: URL, cancellation: SoundCloudCancellation) throws -> SoundCloudCollection {
+        SoundCloudCollection(title: "Мой сет", artist: "Автор", url: link, artwork: nil, tracks: (1...3).map {
+            SoundCloudTrack(id: "set-\($0)", title: "Трек \($0)", artist: "Автор", url: URL(string: "https://soundcloud.com/a/set-\($0)")!)
+        })
+    }
+}
+let collectionModel = SoundCloudStore(service: CollectionFixture(), directory: root.appendingPathComponent("CollectionModel"))
+var handedOff: [(String, String?)] = []
+collectionModel.onReady = { _, track in handedOff.append((track.id, collectionModel.playlistTarget(for: track.id))) }
+collectionModel.query = "https://soundcloud.com/a/sets/my-set"; collectionModel.search()
+waitUI { !collectionModel.isSearching }
+expect(collectionModel.collection?.tracks.count == 3 && collectionModel.selection.count == 3, "a set link opens the set with every track selected")
+collectionModel.selection.remove("set-2")
+let alreadyInLibrary = collectionModel.addCollection(skipping: ["set-3"])
+waitUI { !collectionModel.isDownloading }
+expect(alreadyInLibrary.map(\.id) == ["set-3"] && handedOff.map(\.0).sorted() == ["set-1"] && handedOff[0].1 == "Мой сет",
+       "only selected tracks that are not in the library download, each bound for the set's playlist")
+expect(collectionModel.playlistTarget(for: "set-1") == nil, "a playlist target is used once")
+collectionModel.collectionIntoPlaylist = false
+collectionModel.selection = ["set-2"]
+collectionModel.addCollection(skipping: [])
+waitUI { !collectionModel.isDownloading }
+expect(handedOff.last?.0 == "set-2" && handedOff.last?.1 == nil, "without the set playlist tracks follow the chosen destination")
+collectionModel.closeCollection()
+expect(collectionModel.collection == nil && collectionModel.results.isEmpty, "closing a set returns to search")
+
 final class PreviewFixture: SoundCloudProviding {
     let lock = NSLock()
     var calls: [String] = []
@@ -1424,6 +1487,34 @@ unusedModel.cancelAll()
 expect(((try? FileManager.default.contentsOfDirectory(atPath:root.appendingPathComponent("YTUnused").path)) ?? []).isEmpty,
        "prefetched audio that was never added is deleted when the app quits")
 
+final class PlaylistFixture: YouTubeProviding {
+    let inner = YouTubeFixture()
+    func resolve(_ input:String,cancellation:SoundCloudCancellation) throws -> YouTubeTrack { YouTubeTrack(id:"BaW_jenozKc",title:"Один",artist:"A") }
+    func download(_ track:YouTubeTrack,directory:URL,cancellation:SoundCloudCancellation,stage:@escaping(String)->Void) throws -> URL {
+        try inner.download(track,directory:directory,cancellation:cancellation,stage:stage)
+    }
+    func playlist(_ id:String,cancellation:SoundCloudCancellation) throws -> YouTubeCollection {
+        YouTubeCollection(id:id,title:"Микс",author:"Канал",tracks:[YouTubeTrack(id:"BaW_jenozKc",title:"Один",artist:"A"),
+                                                                    YouTubeTrack(id:"abcdefghijk",title:"Два",artist:"B")])
+    }
+}
+let playlistModel = YouTubeStore(service:PlaylistFixture(),directory:root.appendingPathComponent("YTPlaylistModel"),prefetch:false)
+var ytHandoffs: [(String, String?)] = []
+playlistModel.onReady = { _, track in ytHandoffs.append((track.id, playlistModel.playlistTarget(for: track.id))) }
+playlistModel.query = "https://www.youtube.com/watch?v=BaW_jenozKc&list=PLmix"; playlistModel.search()
+waitUI { !playlistModel.isSearching }
+expect(playlistModel.relatedPlaylistID == "PLmix" && playlistModel.collection == nil && playlistModel.results.first?.title == "Один",
+       "a watch link inside a playlist opens the video and offers the whole playlist")
+playlistModel.openPlaylist("PLmix")
+waitUI { !playlistModel.isSearching }
+expect(playlistModel.collection?.tracks.count == 2 && playlistModel.selection.count == 2, "the whole playlist opens with every video selected")
+playlistModel.addCollection(skipping: [])
+waitUI { !playlistModel.isDownloading }
+expect(ytHandoffs.count == 2 && ytHandoffs.allSatisfy { $0.1 == "Микс" }, "each playlist video is bound for a playlist of the same name")
+playlistModel.query = "https://www.youtube.com/playlist?list=PLother"; playlistModel.search()
+waitUI { !playlistModel.isSearching }
+expect(playlistModel.collection?.id == "PLother", "a playlist link opens the playlist directly")
+
 let ytInfoJSON = Data(#"{"id":"BaW_jenozKc","title":"Info","uploader":"Channel","protocol":"https","ext":"m4a","url":"https://rr3---sn-test.googlevideo.com/videoplayback?itag=140&clen=4096","http_headers":{"User-Agent":"Test","Cookie":"secret"}}"#.utf8)
 let ytInfo = try YouTubeService.parseInfo(ytInfoJSON, expectedID: ytID)
 expect(ytInfo.audioURL?.host == "rr3---sn-test.googlevideo.com" && ytInfo.contentLength == 4096 && ytInfo.fileExtension == "m4a",
@@ -1437,6 +1528,43 @@ let ytPreview = try YouTubeService.parsePreview(Data(#"{"title":"Быстрое\
 expect(ytPreview.id == ytID && ytPreview.artist == "Канал" && !ytPreview.title.contains("\0"), "the quick title card is sanitized and bound to the requested video")
 expect(YouTubeService.m4aArguments(source:URL(fileURLWithPath:"/tmp/in.m4a"),output:URL(fileURLWithPath:"/tmp/out.m4a"),track:ytTrack,codec:["-c:a","copy"]).contains("copy"),
        "AAC input is rewrapped rather than re-encoded")
+expect(YouTubeService.playlistID("https://www.youtube.com/playlist?list=PLabc_-1") == "PLabc_-1"
+       && YouTubeService.playlistID("https://music.youtube.com/watch?v=\(ytID)&list=OLAK5uy_x") == "OLAK5uy_x"
+       && YouTubeService.isPlaylistLink("https://youtube.com/playlist?list=PLabc") && !YouTubeService.isPlaylistLink("https://youtube.com/watch?v=\(ytID)&list=PLabc")
+       && YouTubeService.playlistID("https://www.youtube.com/playlist?list=WL") == nil
+       && YouTubeService.playlistID("https://youtube.com.evil.test/playlist?list=PLabc") == nil,
+       "playlist links are recognised; private lists and foreign hosts are not")
+let flatPlaylist = try JSONSerialization.data(withJSONObject: ["_type": "playlist", "title": "Плейлист", "channel": "Канал", "entries": [
+    ["id": ytID, "title": "Artist - Song (Official Video)", "channel": "Label", "duration": 200],
+    ["id": "abcdefghijk", "title": "[Private video]"],
+    ["id": ytID, "title": "Duplicate"],
+    ["id": "bad", "title": "Bad id"],
+    ["id": "zyxwvutsrqp", "title": "Второй", "channel": "Певица - Topic"]
+]])
+let parsedPlaylist = try YouTubeService.parsePlaylist(flatPlaylist, expectedID: "PL1")
+expect(parsedPlaylist.tracks.map(\.id) == [ytID, "zyxwvutsrqp"] && parsedPlaylist.tracks[0].title == "Song" && parsedPlaylist.tracks[0].artist == "Artist"
+       && parsedPlaylist.tracks[1].artist == "Певица" && parsedPlaylist.title == "Плейлист",
+       "a flat playlist keeps valid, unique, public videos with clean titles")
+let playlistLog = root.appendingPathComponent("yt-playlist-arguments")
+let playlistJSONText = String(data: flatPlaylist, encoding: .utf8)!.replacingOccurrences(of: "'", with: "'\\''")
+let playlistHelper = root.appendingPathComponent("youtube-playlist")
+try "#!/bin/sh\n/usr/bin/printf '%s\\n' \"$@\" >> '\(playlistLog.path)'\n/usr/bin/printf '%s\\n' '\(playlistJSONText)'\n".write(to: playlistHelper, atomically: true, encoding: .utf8)
+try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: playlistHelper.path)
+let playlistService = YouTubeService(helper: playlistHelper, ffmpeg: URL(fileURLWithPath: "/nonexistent/ffmpeg"), runtime: URL(fileURLWithPath: "/usr/bin/true"),
+                                     cache: root.appendingPathComponent("YTPlaylistCache"), fallback: nil)
+let listedPlaylist = try playlistService.playlist("PL1", cancellation: SoundCloudCancellation())
+let playlistArguments = try String(contentsOf: playlistLog, encoding: .utf8).split(separator: "\n")
+expect(listedPlaylist.tracks.count == 2 && playlistArguments.contains("--flat-playlist") && !playlistArguments.contains("--no-playlist")
+       && playlistArguments.contains("https://www.youtube.com/playlist?list=PL1"), "a YouTube playlist is listed flat in one extractor run")
+let relayPlaylist = YouTubeFallback(endpoint: URL(string: "https://relay.example")!, transport: { request, _, _, _ in
+    expect(request.url?.path == "/api/v1/playlists/PL1", "the fallback lists the same playlist")
+    return try JSONSerialization.data(withJSONObject: ["title": "Резерв", "author": "Канал",
+        "videos": [["videoId": ytID, "title": "Песня", "author": "Певец", "lengthSeconds": 120]]])
+})
+let failingPlaylistService = YouTubeService(helper: URL(fileURLWithPath: "/usr/bin/false"), ffmpeg: URL(fileURLWithPath: "/nonexistent/ffmpeg"),
+                                            runtime: URL(fileURLWithPath: "/usr/bin/true"), fallback: relayPlaylist)
+let relayed = try failingPlaylistService.playlist("PL1", cancellation: SoundCloudCancellation())
+expect(relayed.title == "Резерв" && relayed.tracks.first?.artist == "Певец", "a playlist the extractor cannot open comes from the fallback")
 
 let relayEndpoint = URL(string:"https://relay.example")!
 func relayJSON(_ id:String = "BaW_jenozKc", url:String = "https://relay.example/videoplayback?itag=140", extra:[String:Any] = [:]) throws -> Data {
@@ -1621,9 +1749,12 @@ expect(LinkRoute.detect("https://youtu.be/\(ytID)?si=share") == .youTube("https:
        "YouTube and SoundCloud track links are routed to their own tabs")
 expect(LinkRoute.detect("тёмный принц") == nil && LinkRoute.forInput("тёмный принц") == .soundCloud("тёмный принц"),
        "plain words are not treated as links but a search field sends them to SoundCloud")
-expect(LinkRoute.detect("https://example.com/song") == nil && LinkRoute.forInput("https://youtube.com/playlist?list=PL1") == nil
-       && LinkRoute.detect("https://soundcloud.com/artist/sets/album") == nil,
-       "foreign sites, playlists and albums are never routed")
+expect(LinkRoute.detect("https://example.com/song") == nil && LinkRoute.forInput("https://youtube.com/watch?list=WL") == nil
+       && LinkRoute.detect("https://soundcloud.com/artist") == nil,
+       "foreign sites, private lists and profile pages are never routed")
+expect(LinkRoute.detect("https://www.youtube.com/playlist?list=PL1234") == .youTube("https://www.youtube.com/playlist?list=PL1234")
+       && LinkRoute.detect("https://soundcloud.com/artist/sets/album") == .soundCloud("https://soundcloud.com/artist/sets/album"),
+       "YouTube playlists and SoundCloud sets open in their tabs")
 
 let progressLog = root.appendingPathComponent("progress.log")
 try Data("[download] noise\nMDPROGRESS 50 200\nMDPROGRESS 10 NA\nMDPROGRESS 100 2".utf8).write(to: progressLog)

@@ -74,10 +74,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
             if let url { self?.previewPlayer.play(url) } else { self?.previewPlayer.stop() }
         }
         previewPlayer.onFinish = { [weak self] failed in self?.soundCloud.previewEnded(failed: failed) }
-        youtube.onReady = { [weak self] file, track in self?.store.acceptYouTube(file, track: track) }
+        youtube.onReady = { [weak self] file, track in
+            self?.store.acceptYouTube(file, track: track, playlist: self?.youtube.playlistTarget(for: track.id))
+        }
         youtube.onActivity = { [weak self] in self?.updateActivity() }
         youtube.shouldPrefetch = { [weak self] track in self?.store.entry(youTubeID: track.id) == nil }
-        soundCloud.onReady = { [weak self] file, track in self?.store.acceptSoundCloud(file, track: track) }
+        soundCloud.onReady = { [weak self] file, track in
+            self?.store.acceptSoundCloud(file, track: track, playlist: self?.soundCloud.playlistTarget(for: track.id))
+        }
         soundCloud.onActivity = { [weak self] in self?.updateActivity() }
         statusItem = NSStatusBar.system.statusItem(withLength: 30)
         updateIcon(busy: false)

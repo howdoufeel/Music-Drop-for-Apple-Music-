@@ -15,6 +15,13 @@ import Observation
     private(set) var verifying: Set<String> = []
     /// Audio already fetched in the background; Add hands it off at once.
     private(set) var prefetchedIDs: Set<String> = []
+    /// An opened playlist; while it is shown the single-video cards are hidden.
+    private(set) var collection: YouTubeCollection?
+    var selection: Set<String> = []
+    var collectionIntoPlaylist = true
+    /// The playlist of a watch link that was opened as a single video.
+    private(set) var relatedPlaylistID: String?
+    @ObservationIgnored private var playlistTargets: [String: String] = [:]
     private let service: YouTubeProviding
     private let searchQueue = DispatchQueue(label: "tech.musicdrop.youtube.search", qos: .userInitiated, attributes: .concurrent)
     private let downloadQueue: OperationQueue = {
@@ -51,6 +58,9 @@ import Observation
     func search() {
         let input = query.trimmingCharacters(in: .whitespacesAndNewlines)
         if isSearching, activeSearchInput == input { return }
+        if YouTubeService.isPlaylistLink(input), let id = YouTubeService.playlistID(input) { openPlaylist(id, input: input); return }
+        relatedPlaylistID = YouTubeService.playlistID(input)
+        collection = nil
         searchToken?.cancel()
         activeSearchInput = input
         let token = SoundCloudCancellation()
@@ -93,6 +103,56 @@ import Observation
                 }
             }
         }
+    }
+
+    func openPlaylist(_ id: String, input: String? = nil) {
+        searchToken?.cancel()
+        activeSearchInput = input
+        let token = SoundCloudCancellation()
+        searchToken = token
+        dropUnverifiedCards()
+        error = nil
+        isSearching = true
+        didSearch = true
+        relatedPlaylistID = nil
+        searchQueue.async { [weak self] in
+            guard let self else { return }
+            let result = Result { try self.service.playlist(id, cancellation: token) }
+            DispatchQueue.main.async {
+                guard self.searchToken === token else { return }
+                self.isSearching = false
+                switch result {
+                case .success(let collection):
+                    self.collection = collection
+                    self.selection = Set(collection.tracks.map(\.id))
+                case .failure(let error):
+                    if !token.isCancelled { self.error = error.localizedDescription }
+                }
+            }
+        }
+    }
+
+    func closeCollection() {
+        collection = nil
+        selection = []
+    }
+
+    /// Queues every selected video that is not already in the library and returns the ones that are.
+    @discardableResult
+    func addCollection(skipping imported: Set<String>) -> [YouTubeTrack] {
+        guard let collection else { return [] }
+        let playlist = collectionIntoPlaylist ? collection.title : nil
+        var existing: [YouTubeTrack] = []
+        for track in collection.tracks where selection.contains(track.id) {
+            if imported.contains(track.id) { existing.append(track); continue }
+            if let playlist { playlistTargets[track.id] = playlist }
+            add(track)
+        }
+        return existing
+    }
+
+    func playlistTarget(for id: String) -> String? {
+        playlistTargets.removeValue(forKey: id)
     }
 
     /// A card whose check failed or was replaced cannot be downloaded reliably.

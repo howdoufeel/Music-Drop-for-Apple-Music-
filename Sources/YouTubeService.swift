@@ -48,6 +48,15 @@ struct YouTubeMediaInfo {
     let contentLength: Int?
 }
 
+/// A YouTube playlist opened for adding several tracks at once.
+struct YouTubeCollection: Equatable {
+    let id: String
+    let title: String
+    let author: String
+    var tracks: [YouTubeTrack]
+    var url: URL { URL(string: "https://www.youtube.com/playlist?list=" + id)! }
+}
+
 protocol YouTubeProviding {
     /// A quick title card before the full check; nil when unavailable.
     func preview(_ input: String, cancellation: SoundCloudCancellation) -> YouTubeTrack?
@@ -57,9 +66,14 @@ protocol YouTubeProviding {
     /// Like `download`, also reporting the fraction transferred once the size is known.
     func download(_ track: YouTubeTrack, directory: URL, cancellation: SoundCloudCancellation,
                   stage: @escaping (String) -> Void, progress: @escaping (Double) -> Void) throws -> URL
+    /// The videos of a playlist ID accepted by `playlistID`.
+    func playlist(_ id: String, cancellation: SoundCloudCancellation) throws -> YouTubeCollection
 }
 
 extension YouTubeProviding {
+    func playlist(_ id: String, cancellation: SoundCloudCancellation) throws -> YouTubeCollection {
+        throw DropError.message("Плейлисты YouTube здесь не поддерживаются.")
+    }
     func preview(_ input: String, cancellation: SoundCloudCancellation) -> YouTubeTrack? { nil }
     func download(_ track: YouTubeTrack, directory: URL, cancellation: SoundCloudCancellation,
                   stage: @escaping (String) -> Void, progress: @escaping (Double) -> Void) throws -> URL {
@@ -126,6 +140,46 @@ final class YouTubeService: YouTubeProviding {
     }
 
     /// oEmbed answers with the title and channel in a fraction of an extractor run.
+    /// The playlist a link names, from /playlist?list= or a watch link inside a playlist.
+    /// Watch Later, Liked videos and similar private lists need an account and are refused.
+    static func playlistID(_ input: String) -> String? {
+        let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard text.count <= 2_000, !text.contains("\0"), let c = URLComponents(string: text),
+              ["https", "http"].contains(c.scheme?.lowercased() ?? ""), c.user == nil, c.password == nil,
+              c.port == nil || c.port == 443,
+              ["youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com"].contains(c.host?.lowercased() ?? ""),
+              ["/playlist", "/watch"].contains(c.path),
+              let id = c.queryItems?.first(where: { $0.name == "list" })?.value,
+              (2...64).contains(id.count), !["WL", "LL", "LM"].contains(id),
+              id.unicodeScalars.allSatisfy({ CharacterSet.alphanumerics.contains($0) && $0.isASCII || $0 == "_" || $0 == "-" }) else { return nil }
+        return id
+    }
+
+    /// A link that opens a whole playlist rather than one of its videos.
+    static func isPlaylistLink(_ input: String) -> Bool {
+        playlistID(input) != nil && URLComponents(string: input.trimmingCharacters(in: .whitespacesAndNewlines))?.path == "/playlist"
+    }
+
+    static func parsePlaylist(_ data: Data, expectedID: String) throws -> YouTubeCollection {
+        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              root["_type"] as? String == "playlist" else { throw DropError.message("YouTube не открыл этот плейлист.") }
+        func clean(_ text: String) -> String {
+            String(text.unicodeScalars.map { CharacterSet.controlCharacters.contains($0) ? " " : String($0) }.joined()
+                .trimmingCharacters(in: .whitespacesAndNewlines).prefix(400))
+        }
+        var seen: Set<String> = []
+        let tracks: [YouTubeTrack] = (root["entries"] as? [[String: Any]] ?? []).prefix(500).compactMap { entry in
+            guard let id = entry["id"] as? String, (try? videoID("https://youtu.be/" + id)) == id, seen.insert(id).inserted,
+                  let title = entry["title"] as? String, !["[Private video]", "[Deleted video]"].contains(title) else { return nil }
+            let tags = TrackMetadata.youTube(title: clean(title), channel: clean((entry["channel"] as? String) ?? (entry["uploader"] as? String) ?? ""),
+                                             artist: nil, track: nil)
+            return YouTubeTrack(id: id, title: tags.title, artist: tags.artist, duration: entry["duration"] as? Double)
+        }
+        guard !tracks.isEmpty else { throw DropError.message("В этом плейлисте нет доступных видео.") }
+        return YouTubeCollection(id: expectedID, title: clean((root["title"] as? String) ?? "Плейлист YouTube"),
+                                 author: clean((root["channel"] as? String) ?? (root["uploader"] as? String) ?? "YouTube"), tracks: tracks)
+    }
+
     static func parsePreview(_ data: Data, expectedID: String) throws -> YouTubeTrack {
         guard data.count <= 100_000, let item = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let title = item["title"] as? String, !title.isEmpty else {
@@ -285,6 +339,21 @@ final class YouTubeService: YouTubeProviding {
                 }
             }
             _ = outcome.changed.wait(timeout: .now() + 0.05)
+        }
+    }
+
+    /// A flat listing reads titles and IDs only; each video is checked when it is downloaded.
+    func playlist(_ id: String, cancellation: SoundCloudCancellation) throws -> YouTubeCollection {
+        do {
+            try validateTools(needsEncoder: false)
+            let data = try run(helper, arguments: arguments.filter { $0 != "--no-playlist" } + ["--flat-playlist", "--dump-single-json",
+                                                  "--", "https://www.youtube.com/playlist?list=" + id],
+                               cancellation: cancellation, timeout: 90)
+            return try Self.parsePlaylist(data, expectedID: id)
+        } catch {
+            if cancellation.isCancelled { throw SoundCloudError.cancelled }
+            guard let fallback else { throw error }
+            return try fallback.playlist(id, cancellation: cancellation)
         }
     }
 

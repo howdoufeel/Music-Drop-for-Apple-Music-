@@ -16,6 +16,12 @@ import Observation
     private(set) var previewLoading = false
     private(set) var previewIsClip = false
     var previewErrors: [String: String] = [:]
+    /// An opened set; while it is shown the normal results are hidden.
+    private(set) var collection: SoundCloudCollection?
+    var selection: Set<String> = []
+    /// Put the set's tracks into a playlist named after it.
+    var collectionIntoPlaylist = true
+    @ObservationIgnored private var playlistTargets: [String: String] = [:]
     private let service: SoundCloudProviding
     private let searchQueue = DispatchQueue(label: "tech.musicdrop.soundcloud.search", qos: .userInitiated, attributes: .concurrent)
     private let downloadQueue: OperationQueue = {
@@ -47,6 +53,8 @@ import Observation
     func search() {
         let input = query.trimmingCharacters(in: .whitespacesAndNewlines)
         if isSearching, activeSearchInput == input { return }
+        if let link = SoundCloudService.collectionTarget(input) { openCollection(link, input: input); return }
+        collection = nil
         searchToken?.cancel()
         activeSearchInput = input
         let token = SoundCloudCancellation()
@@ -79,6 +87,60 @@ import Observation
                 }
             }
         }
+    }
+
+    private func openCollection(_ link: URL, input: String) {
+        searchToken?.cancel()
+        activeSearchInput = input
+        let token = SoundCloudCancellation()
+        searchToken = token
+        error = nil
+        isSearching = true
+        didSearch = true
+        searchQueue.async { [weak self] in
+            guard let self else { return }
+            let result = Result { try self.service.collection(link, cancellation: token) }
+            DispatchQueue.main.async {
+                guard self.searchToken === token else { return }
+                self.isSearching = false
+                switch result {
+                case .success(let collection):
+                    self.collection = collection
+                    self.results = collection.tracks
+                    self.selection = Set(collection.tracks.map(\.id))
+                case .failure(let error):
+                    if !token.isCancelled { self.error = error.localizedDescription }
+                }
+                self.stopPreviewIfUnlisted()
+            }
+        }
+    }
+
+    func closeCollection() {
+        collection = nil
+        selection = []
+        results = []
+        stopPreviewIfUnlisted()
+    }
+
+    /// Queues every selected track that is not already in the library and returns the ones that are,
+    /// so the caller can still put them into the set's playlist.
+    @discardableResult
+    func addCollection(skipping imported: Set<String>) -> [SoundCloudTrack] {
+        guard let collection else { return [] }
+        let playlist = collectionIntoPlaylist ? collection.title : nil
+        var existing: [SoundCloudTrack] = []
+        for track in collection.tracks where selection.contains(track.id) {
+            if imported.contains(track.id) { existing.append(track); continue }
+            if let playlist { playlistTargets[track.id] = playlist }
+            add(track)
+        }
+        return existing
+    }
+
+    /// The playlist a queued track should go into, when it differs from the chosen destination.
+    func playlistTarget(for id: String) -> String? {
+        playlistTargets.removeValue(forKey: id)
     }
 
     /// Starts listening to a result; any other preview stops first.
