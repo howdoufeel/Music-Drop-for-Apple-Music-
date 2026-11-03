@@ -6,6 +6,8 @@ struct MusicResult {
     let cloudStatus: String
     var isFavorite: Bool? = nil
     var favoriteError: String? = nil
+    var artist: String? = nil
+    var duration: Double? = nil
 }
 
 struct AutomationError: LocalizedError {
@@ -86,7 +88,7 @@ enum MusicBridge {
                 try
                     set cloudState to cloud status of addedTrack as string
                 end try
-                return {persistent ID of addedTrack, name of addedTrack, cloudState, favoriteState, favoriteProblem}
+                return {persistent ID of addedTrack, name of addedTrack, cloudState, favoriteState, favoriteProblem, artist of addedTrack, duration of addedTrack}
             end tell
         end timeout
         """
@@ -104,7 +106,8 @@ enum MusicBridge {
         let problem = result.atIndex(5)?.stringValue ?? ""
         return MusicResult(id: id, title: result.atIndex(2)?.stringValue ?? url.lastPathComponent,
                            cloudStatus: result.atIndex(3)?.stringValue ?? "unknown", isFavorite: favorite,
-                           favoriteError: favorite ? nil : "Трек в медиатеке, но избранное не подтверждено. " + problem)
+                           favoriteError: favorite ? nil : "Трек в медиатеке, но избранное не подтверждено. " + problem,
+                           artist: result.atIndex(6)?.stringValue?.nonEmpty, duration: result.atIndex(7)?.doubleValue)
     }
 
     /// Creates the playlist on first use and never adds the same track twice.
@@ -148,6 +151,25 @@ enum MusicBridge {
         let list = try execute(playlistNamesSource)
         guard list.numberOfItems > 0 else { return list.stringValue.map { [$0] } ?? [] }
         return (1...list.numberOfItems).compactMap { list.atIndex($0)?.stringValue }
+    }
+
+    static func deleteSource(id: String) -> String {
+        """
+        with timeout of 30 seconds
+            tell application id "com.apple.Music"
+                set foundTracks to (every track of library playlist 1 whose persistent ID is \(FileTools.appleScriptLiteral(id)))
+                if (count of foundTracks) is 0 then return false
+                delete item 1 of foundTracks
+                return true
+            end tell
+        end timeout
+        """
+    }
+
+    /// Removes the track from the library, and so from iCloud and every playlist.
+    static func deleteTrack(id: String) throws {
+        try ensureRunning()
+        _ = try execute(deleteSource(id: id))
     }
 
     static func favoriteSource(id: String) -> String {

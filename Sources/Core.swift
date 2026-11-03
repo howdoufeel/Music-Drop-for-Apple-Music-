@@ -29,6 +29,8 @@ struct ImportEntry: Codable, Identifiable, Equatable {
     var youtubeURL: URL?
     /// The playlist the track goes into after the import; nil keeps it in the library only.
     var playlist: String?
+    var artist: String?
+    var duration: Double?
     var playlistError: String?
     var error: String?
 
@@ -66,6 +68,41 @@ struct AudioTags {
         let url = directory.appendingPathComponent("cover.jpg")
         return (try? artwork.write(to: url)) == nil ? nil : url
     }
+}
+
+/// Narrows the history list; the words also match artists and playlists.
+enum HistoryFilter: String, CaseIterable, Identifiable {
+    case all, soundCloud, youTube, files, waitingForCloud, problems
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .all: return "Все"
+        case .soundCloud: return "SoundCloud"
+        case .youTube: return "YouTube"
+        case .files: return "Файлы MP3"
+        case .waitingForCloud: return "Ждут облака"
+        case .problems: return "С ошибками"
+        }
+    }
+}
+
+extension ImportEntry {
+    func matches(_ filter: HistoryFilter, query: String) -> Bool {
+        let words = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !words.isEmpty, ![title, artist ?? "", playlist ?? ""].contains(where: { $0.localizedCaseInsensitiveContains(words) }) { return false }
+        switch filter {
+        case .all: return true
+        case .soundCloud: return soundCloudID != nil
+        case .youTube: return youtubeID != nil
+        case .files: return soundCloudID == nil && youtubeID == nil
+        case .waitingForCloud: return stage == .imported && cloudSyncPending == true && CloudState.canAutoRetry(cloudStatus)
+        case .problems:
+            return stage == .failed || stage == .needsReview || favoriteError != nil || playlistError != nil || CloudState.isWarning(cloudStatus)
+        }
+    }
+
+    /// The page the track came from.
+    var sourceURL: URL? { soundCloudURL ?? youtubeURL }
 }
 
 enum DropError: LocalizedError {

@@ -11,7 +11,7 @@ struct YouTubePanel: View {
     var body: some View {
         VStack(spacing: 12) {
             HStack(spacing: 7) {
-                TextField("Ссылка на видео или плейлист YouTube", text: $model.query)
+                TextField("Название, ссылка на видео или плейлист", text: $model.query)
                     .textFieldStyle(.roundedBorder).focused($searchFocused).onSubmit(submit)
                     .accessibilityLabel("Ссылка на трек YouTube")
                     // Focus on arrival and on every ⌘F.
@@ -53,7 +53,7 @@ struct YouTubePanel: View {
                         VStack(spacing: 10) {
                             Image(systemName: "play.rectangle").font(.system(size: 34, weight: .light)).foregroundStyle(.red)
                             Text("Трек с YouTube — в медиатеку").font(.system(size: 16, weight: .semibold))
-                            Text("Вставь ссылку на видео или плейлист. Сохраним аудио с обложкой и добавим в Apple Music и избранное.")
+                            Text("Найди трек по названию или вставь ссылку на видео или плейлист. Сохраним аудио с обложкой и добавим в Apple Music и избранное.")
                                 .font(.system(size: 12)).foregroundStyle(.secondary).multilineTextAlignment(.center)
                         }.frame(maxWidth: .infinity).padding(.vertical, 45)
                     }
@@ -77,9 +77,10 @@ struct YouTubePanel: View {
         let downloading = collection.tracks.filter { model.downloadStates[$0.id] != nil }.count
         return CollectionHeader(title: collection.title, subtitle: collection.author,
                                 artwork: collection.tracks.first.flatMap { URL(string: "https://i.ytimg.com/vi/\($0.id)/mqdefault.jpg") },
-                                symbol: "list.bullet.rectangle", tint: .red, total: collection.tracks.count,
+                                symbol: collection.isSearch ? "magnifyingglass" : "list.bullet.rectangle", tint: .red, total: collection.tracks.count,
                                 selected: model.selection.intersection(collection.tracks.map(\.id)).count,
                                 added: added, inFlight: importing + downloading, intoPlaylist: $model.collectionIntoPlaylist,
+                                allowsPlaylist: !collection.isSearch,
                                 selectAll: { model.selection = Set(collection.tracks.filter { imports.entry(youTubeID: $0.id)?.stage != .imported }.map(\.id)) },
                                 selectNone: { model.selection = [] },
                                 add: { addCollection(collection) },
@@ -125,17 +126,18 @@ struct YouTubePanel: View {
             } else if model.downloadStates[track.id] != nil {
                 Button { model.cancel(track) } label: { Image(systemName: "xmark.circle") }
                     .buttonStyle(.borderless).help("Отменить загрузку").accessibilityLabel("Отменить загрузку \(track.title)")
+            } else if entry == nil {
+                Button { model.add(track) } label: { Image(systemName: "plus.circle") }
+                    .buttonStyle(.borderless).help("Добавить в Apple Music").accessibilityLabel("Добавить \(track.title) в Apple Music")
             }
         }
         .padding(.vertical, 8)
     }
 
-    /// SoundCloud links and plain words go to SoundCloud; YouTube links and malformed links stay here.
+    /// SoundCloud links open in their tab; YouTube links, playlists and plain words are handled here.
     private func submit() {
-        switch LinkRoute.forInput(model.query) {
-        case .soundCloud(let text)?: navigation.open(.soundCloud(text))
-        default: model.search()
-        }
+        if case .soundCloud(let link)? = LinkRoute.detect(model.query) { navigation.open(.soundCloud(link)) }
+        else { model.search() }
     }
 
     private func row(_ track: YouTubeTrack) -> some View {

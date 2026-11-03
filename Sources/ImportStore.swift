@@ -27,6 +27,7 @@ struct ImportServices {
     var prepareMusic: () throws -> Void = MusicBridge.prepare
     var addToPlaylist: (String, String) throws -> Void = MusicBridge.addToPlaylist
     var playlistNames: () throws -> [String] = MusicBridge.playlistNames
+    var deleteTrack: (String) throws -> Void = MusicBridge.deleteTrack
 }
 
 /// Coalesces history writes off the main thread; the newest snapshot always wins.
@@ -265,7 +266,8 @@ private final class HistoryWriter {
             return
         }
         let entry = ImportEntry(sourcePath: url.path, title: track.title,
-                                soundCloudID: track.id, soundCloudURL: track.url, playlist: target)
+                                soundCloudID: track.id, soundCloudURL: track.url, playlist: target,
+                                artist: track.artist, duration: track.duration)
         entries.insert(entry, at: 0)
         save()
         performImport(entry)
@@ -285,7 +287,8 @@ private final class HistoryWriter {
             return
         }
         let entry = ImportEntry(sourcePath: url.path, title: track.title,
-                                youtubeID: track.id, youtubeURL: track.url, playlist: target)
+                                youtubeID: track.id, youtubeURL: track.url, playlist: target,
+                                artist: track.artist, duration: track.duration)
         entries.insert(entry, at: 0)
         save()
         performImport(entry)
@@ -365,6 +368,37 @@ private final class HistoryWriter {
         let unique = names.filter { seen.insert($0).inserted }.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
         if unique != availablePlaylists { availablePlaylists = unique }
         defaults.set(unique, forKey: Self.playlistsKey)
+    }
+
+    /// Forgets the entry; the track stays in Music and its file stays on disk.
+    func removeFromHistory(_ entry: ImportEntry) {
+        guard entry.stage != .queued, entry.stage != .importing else { return }
+        entries.removeAll { $0.id == entry.id }
+        save()
+    }
+
+    /// Deletes the track from Music, then its history entry and Music Drop's own copy of the file.
+    func deleteFromLibrary(_ entry: ImportEntry) {
+        guard !preview, entry.stage == .imported, let trackID = entry.trackID else { return }
+        queue.async { [weak self] in
+            guard let self else { return }
+            do {
+                try self.services.deleteTrack(trackID)
+                DispatchQueue.main.async {
+                    self.entries.removeAll { $0.id == entry.id }
+                    self.save()
+                    if let path = entry.managedPath, !self.entries.contains(where: { $0.managedPath == path }) {
+                        let file = URL(fileURLWithPath: path)
+                        let media = self.directory.appendingPathComponent("Media").standardizedFileURL.path + "/"
+                        if file.standardizedFileURL.path.hasPrefix(media) {
+                            try? FileManager.default.removeItem(at: file.deletingLastPathComponent())
+                        }
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async { self.notice = "Не удалось удалить «\(entry.title)» из «Музыки»: " + error.localizedDescription }
+            }
+        }
     }
 
     /// Puts an imported track into a playlist without importing it again.
@@ -473,6 +507,8 @@ private final class HistoryWriter {
                         $0.cloudStatus = result.cloudStatus; $0.stage = .imported; $0.error = nil
                         $0.isFavorite = result.isFavorite; $0.favoriteError = result.favoriteError
                         $0.playlistError = playlistProblem
+                        $0.artist = result.artist ?? $0.artist
+                        $0.duration = result.duration ?? $0.duration
                     }
                     if let imported = self.entries.first(where: { $0.id == entry.id }) { self.onImported?(imported) }
                     self.requestCloudUpdate(for: [entry.id])

@@ -64,6 +64,7 @@ import Observation
         autoAddInput = autoAdd ? input : nil
         if isSearching, activeSearchInput == input { return }
         if YouTubeService.isPlaylistLink(input), let id = YouTubeService.playlistID(input) { openPlaylist(id, input: input); return }
+        if !input.isEmpty, !input.contains("://") { openSearch(input); return }
         relatedPlaylistID = YouTubeService.playlistID(input)
         collection = nil
         searchToken?.cancel()
@@ -114,7 +115,16 @@ import Observation
         }
     }
 
+    private func openSearch(_ words: String) {
+        load(input: words, select: false) { try $0.searchVideos(words, cancellation: $1) }
+    }
+
     func openPlaylist(_ id: String, input: String? = nil) {
+        load(input: input, select: true) { try $0.playlist(id, cancellation: $1) }
+    }
+
+    /// Playlists start fully selected; search results start empty, since one of them is usually wanted.
+    private func load(input: String?, select: Bool, _ work: @escaping (YouTubeProviding, SoundCloudCancellation) throws -> YouTubeCollection) {
         searchToken?.cancel()
         activeSearchInput = input
         let token = SoundCloudCancellation()
@@ -126,14 +136,14 @@ import Observation
         relatedPlaylistID = nil
         searchQueue.async { [weak self] in
             guard let self else { return }
-            let result = Result { try self.service.playlist(id, cancellation: token) }
+            let result = Result { try work(self.service, token) }
             DispatchQueue.main.async {
                 guard self.searchToken === token else { return }
                 self.isSearching = false
                 switch result {
                 case .success(let collection):
                     self.collection = collection
-                    self.selection = Set(collection.tracks.map(\.id))
+                    self.selection = select ? Set(collection.tracks.map(\.id)) : []
                 case .failure(let error):
                     if !token.isCancelled { self.error = error.localizedDescription }
                 }
@@ -150,7 +160,7 @@ import Observation
     @discardableResult
     func addCollection(skipping imported: Set<String>) -> [YouTubeTrack] {
         guard let collection else { return [] }
-        let playlist = collectionIntoPlaylist ? collection.title : nil
+        let playlist = collectionIntoPlaylist && !collection.isSearch ? collection.title : nil
         var existing: [YouTubeTrack] = []
         for track in collection.tracks where selection.contains(track.id) {
             if imported.contains(track.id) { existing.append(track); continue }

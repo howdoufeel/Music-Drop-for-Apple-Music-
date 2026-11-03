@@ -69,6 +69,7 @@ struct CollectionHeader: View {
     let added: Int
     let inFlight: Int
     @Binding var intoPlaylist: Bool
+    var allowsPlaylist = true
     let selectAll: () -> Void
     let selectNone: () -> Void
     let add: () -> Void
@@ -88,7 +89,9 @@ struct CollectionHeader: View {
                     .buttonStyle(.borderless).foregroundStyle(.secondary)
                     .help("Закрыть").accessibilityLabel("Закрыть «\(title)»")
             }
-            Toggle("Добавить в плейлист «\(title)»", isOn: $intoPlaylist).toggleStyle(.checkbox).font(.system(size: 11))
+            if allowsPlaylist {
+                Toggle("Добавить в плейлист «\(title)»", isOn: $intoPlaylist).toggleStyle(.checkbox).font(.system(size: 11))
+            }
             HStack(spacing: 12) {
                 Button("Выбрать все", action: selectAll).buttonStyle(.borderless).disabled(selected == total)
                 Button("Снять все", action: selectNone).buttonStyle(.borderless).disabled(selected == 0)
@@ -130,6 +133,9 @@ struct DropPanel: View {
     @State private var extractor = ExtractorUpdateModel()
     @State private var notificationsOn = Notifier.shared.enabled
     @State private var hotKeyOn = HotKey.enabled
+    @State private var historyQuery = ""
+    @State private var historyFilter = HistoryFilter.all
+    @State private var historyLimit = 100
     @State private var creatingPlaylist = false
     @State private var newPlaylistName = ""
 
@@ -302,11 +308,33 @@ struct DropPanel: View {
                 }
                 .frame(maxWidth: .infinity).padding(.vertical, 20)
             } else {
-                LazyVStack(spacing: 0) {
-                    ForEach(Array(store.entries.prefix(100))) { entry in
-                        HistoryRow(entry: entry, store: store)
-                        if entry.id != store.entries.prefix(100).last?.id { Divider().padding(.leading, 44) }
+                if store.entries.count > 3 {
+                    HStack(spacing: 6) {
+                        TextField("Поиск по истории", text: $historyQuery).textFieldStyle(.roundedBorder).controlSize(.small)
+                        Menu(historyFilter.label) {
+                            ForEach(HistoryFilter.allCases) { filter in
+                                Button { historyFilter = filter } label: {
+                                    if filter == historyFilter { Label(filter.label, systemImage: "checkmark") } else { Text(filter.label) }
+                                }
+                            }
+                        }
+                        .menuStyle(.borderlessButton).fixedSize().font(.system(size: 11))
                     }
+                }
+                let shown = store.entries.filter { $0.matches(historyFilter, query: historyQuery) }
+                if shown.isEmpty {
+                    Text("Ничего не найдено").font(.system(size: 11)).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity).padding(.vertical, 12)
+                }
+                LazyVStack(spacing: 0) {
+                    ForEach(Array(shown.prefix(historyLimit))) { entry in
+                        HistoryRow(entry: entry, store: store)
+                        if entry.id != shown.prefix(historyLimit).last?.id { Divider().padding(.leading, 44) }
+                    }
+                }
+                if shown.count > historyLimit {
+                    Button("Показать ещё \(min(100, shown.count - historyLimit))") { historyLimit += 100 }
+                        .buttonStyle(.borderless).font(.system(size: 11)).frame(maxWidth: .infinity)
                 }
             }
         }
@@ -444,6 +472,7 @@ struct DropPanel: View {
 private struct HistoryRow: View {
     let entry: ImportEntry
     let store: ImportStore
+    @State private var confirmingDelete = false
 
     private var working: Bool {
         entry.stage == .queued || entry.stage == .importing || store.updatingFavorites.contains(entry.id)
@@ -569,6 +598,22 @@ private struct HistoryRow: View {
                     NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
                 }
             }
+            if let source = entry.sourceURL {
+                Button(entry.soundCloudURL != nil ? "Открыть на SoundCloud" : "Открыть на YouTube") { NSWorkspace.shared.open(source) }
+            }
+            Divider()
+            if entry.stage != .queued, entry.stage != .importing {
+                Button("Убрать из истории") { store.removeFromHistory(entry) }
+            }
+            if entry.stage == .imported, entry.trackID != nil {
+                Button("Удалить из медиатеки…", role: .destructive) { confirmingDelete = true }
+            }
+        }
+        .confirmationDialog("Удалить «\(entry.title)» из медиатеки «Музыки»?", isPresented: $confirmingDelete) {
+            Button("Удалить", role: .destructive) { store.deleteFromLibrary(entry) }
+            Button("Отмена", role: .cancel) {}
+        } message: {
+            Text("Трек пропадёт из «Музыки», её плейлистов и облачной медиатеки на всех устройствах.")
         }
     }
 }

@@ -121,6 +121,8 @@ let favoriteScript = NSAppleScript(source: MusicBridge.favoriteSource(id: "00000
 expect(favoriteScript.compileAndReturnError(&scriptError), "favorite-only AppleScript compiles without executing")
 let playlistScript = NSAppleScript(source: MusicBridge.playlistSource(id: "00000000000000A1", playlist: "Плейлист \"в кавычках\""))!
 expect(playlistScript.compileAndReturnError(&scriptError), "the playlist AppleScript compiles with a quoted Unicode name: \(String(describing: scriptError))")
+let deleteScript = NSAppleScript(source: MusicBridge.deleteSource(id: "00000000000000A1"))!
+expect(deleteScript.compileAndReturnError(&scriptError), "the library deletion AppleScript compiles without executing")
 let playlistNamesScript = NSAppleScript(source: MusicBridge.playlistNamesSource)!
 expect(playlistNamesScript.compileAndReturnError(&scriptError), "the playlist list AppleScript compiles: \(String(describing: scriptError))")
 expect(!CloudState.isReady("unknown") && CloudState.isReady("matched"), "cloud status does not claim unconfirmed upload")
@@ -258,6 +260,39 @@ do {
     let failingFile = root.appendingPathComponent("event-fail.mp3"); try Data("event-fail".utf8).write(to: failingFile)
     failingEventStore.accept([failingFile]); settle(failingEventStore)
     expect(reported == ["ok:Трек один", "failed:event-fail"], "finished and failed imports are reported once each")
+}
+
+// History: words and filters narrow the list; entries can be forgotten or deleted from Music.
+do {
+    let sc = ImportEntry(sourcePath: "", title: "Ночной трек", stage: .imported, trackID: "H1", cloudStatus: "uploaded",
+                         soundCloudID: "1", soundCloudURL: URL(string: "https://soundcloud.com/a/b"), playlist: "Лето", artist: "Группа")
+    let yt = ImportEntry(sourcePath: "", title: "Видео", stage: .imported, trackID: "H2", cloudStatus: "not uploaded", cloudSyncPending: true,
+                         youtubeID: "BaW_jenozKc", youtubeURL: URL(string: "https://www.youtube.com/watch?v=BaW_jenozKc"))
+    let file = ImportEntry(sourcePath: "/tmp/a.mp3", title: "Файл", stage: .failed, error: "Сломан")
+    let all = [sc, yt, file]
+    expect(all.filter { $0.matches(.soundCloud, query: "") } == [sc] && all.filter { $0.matches(.youTube, query: "") } == [yt]
+           && all.filter { $0.matches(.files, query: "") } == [file] && all.filter { $0.matches(.waitingForCloud, query: "") } == [yt]
+           && all.filter { $0.matches(.problems, query: "") } == [file], "history filters pick sources, cloud waits and problems")
+    expect(all.filter { $0.matches(.all, query: "группа") } == [sc] && all.filter { $0.matches(.all, query: "лето") } == [sc]
+           && all.filter { $0.matches(.all, query: "ВИДЕО") } == [yt] && sc.sourceURL?.host == "soundcloud.com",
+           "history search matches titles, artists and playlists in any case")
+    var deleted: [String] = []
+    var historyServices = services
+    historyServices.deleteTrack = { deleted.append($0) }
+    let historyRoot = root.appendingPathComponent("HistoryState")
+    let historyStore = ImportStore(directory: historyRoot, services: historyServices, startTimer: false)
+    let keptFile = root.appendingPathComponent("history-keep.mp3"); try Data("history-keep".utf8).write(to: keptFile)
+    let goneFile = root.appendingPathComponent("history-gone.mp3"); try Data("history-gone".utf8).write(to: goneFile)
+    historyStore.accept([keptFile, goneFile]); settle(historyStore)
+    let toForget = historyStore.entries[1], toDelete = historyStore.entries[0]
+    historyStore.removeFromHistory(toForget)
+    expect(historyStore.entries.count == 1 && deleted.isEmpty && FileManager.default.fileExists(atPath: toForget.managedPath!),
+           "forgetting an entry keeps the track in Music and its file on disk")
+    historyStore.deleteFromLibrary(toDelete)
+    let deleteDeadline = Date().addingTimeInterval(3)
+    while !historyStore.entries.isEmpty, Date() < deleteDeadline { RunLoop.main.run(until: Date().addingTimeInterval(0.01)) }
+    expect(historyStore.entries.isEmpty && deleted == [toDelete.trackID!] && !FileManager.default.fileExists(atPath: toDelete.managedPath!),
+           "deleting from the library removes the Music track, its entry and Music Drop's copy")
 }
 
 // A chosen playlist receives every new track; existing tracks join it without another import.
@@ -1453,9 +1488,11 @@ final class YouTubeFixture: YouTubeProviding {
     let lock = NSLock()
     var downloads = 0
     func resolve(_ input:String,cancellation:SoundCloudCancellation) throws -> YouTubeTrack {
-        if input == "failure" { throw DropError.message("Unavailable") }
-        if input == "old" { Thread.sleep(forTimeInterval:0.3) }
-        return YouTubeTrack(id: input == "old" ? "abcdefghijk" : "BaW_jenozKc",title:input,artist:"Artist")
+        // Links such as https://youtu.be/old name the case they exercise.
+        let name = URL(string: input)?.lastPathComponent ?? input
+        if name == "failure" { throw DropError.message("Unavailable") }
+        if name == "old" { Thread.sleep(forTimeInterval:0.3) }
+        return YouTubeTrack(id: name == "old" ? "abcdefghijk" : "BaW_jenozKc",title:name,artist:"Artist")
     }
     func download(_ track:YouTubeTrack,directory:URL,cancellation:SoundCloudCancellation,stage:@escaping(String)->Void) throws -> URL {
         lock.lock(); downloads += 1; lock.unlock()
@@ -1469,7 +1506,7 @@ final class YouTubeFixture: YouTubeProviding {
 }
 let ytProvider = YouTubeFixture()
 let ytModel = YouTubeStore(service:ytProvider,directory:root.appendingPathComponent("YTModel"),prefetch:false)
-ytModel.query = "old"; ytModel.search(); ytModel.query = "new"; ytModel.search()
+ytModel.query = "https://youtu.be/old"; ytModel.search(); ytModel.query = "https://youtu.be/new"; ytModel.search()
 waitUI { !ytModel.isSearching }
 RunLoop.main.run(until:Date().addingTimeInterval(0.35))
 expect(ytModel.results.first?.title == "new", "stale YouTube resolution cannot replace the latest result")
@@ -1482,18 +1519,18 @@ expect(ytReady == 0, "cancelled YouTube UI operations never hand audio to Apple 
 ytModel.add(ytModel.results[0]); ytModel.add(ytModel.results[0])
 waitUI { !ytModel.isDownloading }
 expect(ytReady == 1, "repeated YouTube Add presses produce one import handoff")
-ytModel.query = "failure"; ytModel.search()
+ytModel.query = "https://youtu.be/failure"; ytModel.search()
 waitUI { !ytModel.isSearching }
 expect(ytModel.error != nil && ytModel.results.first?.id == ytID, "a failed next YouTube link preserves existing track cards and download controls")
 
 final class QuickYouTubeFixture: YouTubeProviding {
     let inner = YouTubeFixture()
     func preview(_ input:String,cancellation:SoundCloudCancellation) -> YouTubeTrack? {
-        input == "broken" ? YouTubeTrack(id:"zzzzzzzzzzz",title:"Quick broken",artist:"Artist") : YouTubeTrack(id:"BaW_jenozKc",title:"Quick",artist:"Artist")
+        input.hasSuffix("broken") ? YouTubeTrack(id:"zzzzzzzzzzz",title:"Quick broken",artist:"Artist") : YouTubeTrack(id:"BaW_jenozKc",title:"Quick",artist:"Artist")
     }
     func resolve(_ input:String,cancellation:SoundCloudCancellation) throws -> YouTubeTrack {
         Thread.sleep(forTimeInterval:0.2)
-        if input == "broken" { throw DropError.message("Unavailable") }
+        if input.hasSuffix("broken") { throw DropError.message("Unavailable") }
         return YouTubeTrack(id:"BaW_jenozKc",title:"Full",artist:"Artist",duration:10)
     }
     func download(_ track:YouTubeTrack,directory:URL,cancellation:SoundCloudCancellation,stage:@escaping(String)->Void) throws -> URL {
@@ -1504,7 +1541,7 @@ let quickProvider = QuickYouTubeFixture()
 let prefetchModel = YouTubeStore(service:quickProvider,directory:root.appendingPathComponent("YTPrefetch"))
 var prefetchReady: [URL] = []
 prefetchModel.onReady = { file,_ in prefetchReady.append(file) }
-prefetchModel.query = "quick"; prefetchModel.search()
+prefetchModel.query = "https://youtu.be/quick"; prefetchModel.search()
 waitUI { prefetchModel.results.first?.title == "Quick" }
 expect(prefetchModel.isSearching && prefetchModel.verifying.contains(ytID), "a quick title card appears before the full link check finishes")
 waitUI { prefetchModel.prefetchedIDs.contains(ytID) }
@@ -1513,12 +1550,12 @@ expect(prefetchModel.results.first?.title == "Full" && prefetchReady.isEmpty && 
 prefetchModel.add(prefetchModel.results[0])
 expect(prefetchReady.count == 1 && quickProvider.inner.downloadCount == 1 && FileManager.default.fileExists(atPath:prefetchReady[0].path),
        "Add hands prefetched audio over at once without a second download")
-prefetchModel.query = "broken"; prefetchModel.search()
+prefetchModel.query = "https://youtu.be/broken"; prefetchModel.search()
 waitUI { !prefetchModel.isSearching }
 expect(prefetchModel.error != nil && !prefetchModel.results.contains { $0.id == "zzzzzzzzzzz" } && prefetchModel.results.first?.id == ytID,
        "a quick card whose full check fails is removed while earlier cards stay")
 let unusedModel = YouTubeStore(service:QuickYouTubeFixture(),directory:root.appendingPathComponent("YTUnused"))
-unusedModel.query = "quick"; unusedModel.search()
+unusedModel.query = "https://youtu.be/quick"; unusedModel.search()
 waitUI { unusedModel.prefetchedIDs.contains(ytID) }
 unusedModel.cancelAll()
 expect(((try? FileManager.default.contentsOfDirectory(atPath:root.appendingPathComponent("YTUnused").path)) ?? []).isEmpty,
@@ -1535,6 +1572,27 @@ final class PlaylistFixture: YouTubeProviding {
                                                                     YouTubeTrack(id:"abcdefghijk",title:"Два",artist:"B")])
     }
 }
+final class SearchFixture: YouTubeProviding {
+    func resolve(_ input:String,cancellation:SoundCloudCancellation) throws -> YouTubeTrack { throw DropError.message("not a link") }
+    func download(_ track:YouTubeTrack,directory:URL,cancellation:SoundCloudCancellation,stage:@escaping(String)->Void) throws -> URL {
+        directory.appendingPathComponent(track.id + ".m4a")
+    }
+    func searchVideos(_ query:String,cancellation:SoundCloudCancellation) throws -> YouTubeCollection {
+        YouTubeCollection(id:"search",title:"Поиск: " + query,author:"YouTube",tracks:[YouTubeTrack(id:"BaW_jenozKc",title:"Hit",artist:"Band")],isSearch:true)
+    }
+}
+let wordModel = YouTubeStore(service:SearchFixture(),directory:root.appendingPathComponent("YTWords"),prefetch:false)
+var wordHandoffs: [String?] = []
+wordModel.onReady = { _, track in wordHandoffs.append(wordModel.playlistTarget(for: track.id)) }
+wordModel.query = "band hit"; wordModel.search()
+waitUI { !wordModel.isSearching }
+expect(wordModel.collection?.isSearch == true && wordModel.selection.isEmpty && wordModel.error == nil,
+       "words in the YouTube field search YouTube, with nothing selected yet")
+wordModel.selection = ["BaW_jenozKc"]
+wordModel.addCollection(skipping: [])
+waitUI { !wordModel.isDownloading }
+expect(wordHandoffs == [nil], "search results never create a playlist named after the search")
+
 let playlistModel = YouTubeStore(service:PlaylistFixture(),directory:root.appendingPathComponent("YTPlaylistModel"),prefetch:false)
 var ytHandoffs: [(String, String?)] = []
 playlistModel.onReady = { _, track in ytHandoffs.append((track.id, playlistModel.playlistTarget(for: track.id))) }
@@ -1593,6 +1651,25 @@ let listedPlaylist = try playlistService.playlist("PL1", cancellation: SoundClou
 let playlistArguments = try String(contentsOf: playlistLog, encoding: .utf8).split(separator: "\n")
 expect(listedPlaylist.tracks.count == 2 && playlistArguments.contains("--flat-playlist") && !playlistArguments.contains("--no-playlist")
        && playlistArguments.contains("https://www.youtube.com/playlist?list=PL1"), "a YouTube playlist is listed flat in one extractor run")
+let searchLog = root.appendingPathComponent("yt-search-arguments")
+let searchHelper = root.appendingPathComponent("youtube-search")
+try "#!/bin/sh\n/usr/bin/printf '%s\\n' \"$@\" >> '\(searchLog.path)'\n/usr/bin/printf '%s\\n' '\(playlistJSONText)'\n".write(to: searchHelper, atomically: true, encoding: .utf8)
+try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: searchHelper.path)
+let searchService = YouTubeService(helper: searchHelper, ffmpeg: URL(fileURLWithPath: "/nonexistent/ffmpeg"), runtime: URL(fileURLWithPath: "/usr/bin/true"),
+                                   cache: root.appendingPathComponent("YTSearchCache"), fallback: nil)
+let found = try searchService.searchVideos("daft punk; rm -rf /", cancellation: SoundCloudCancellation())
+let searchArguments = try String(contentsOf: searchLog, encoding: .utf8).split(separator: "\n")
+expect(found.isSearch && found.tracks.count == 2 && found.title == "Поиск: daft punk; rm -rf /"
+       && searchArguments.contains("ytsearch20:daft punk; rm -rf /") && searchArguments.contains("--flat-playlist"),
+       "YouTube word search lists twenty results flat and passes the words as one argument")
+let relaySearch = YouTubeFallback(endpoint: URL(string: "https://relay.example")!, transport: { request, _, _, _ in
+    expect(request.url?.path == "/api/v1/search" && request.url?.query?.contains("type=video") == true, "the fallback searches videos only")
+    return try JSONSerialization.data(withJSONObject: [["type": "video", "videoId": ytID, "title": "Band - Hit (Official Audio)", "author": "BandVEVO"],
+                                                       ["type": "channel", "authorId": "x"]])
+})
+let relayFound = try relaySearch.searchVideos("hit", cancellation: SoundCloudCancellation())
+expect(relayFound.tracks.count == 1 && relayFound.tracks[0].title == "Hit" && relayFound.tracks[0].artist == "Band" && relayFound.isSearch,
+       "fallback search results skip channels and get clean titles")
 let relayPlaylist = YouTubeFallback(endpoint: URL(string: "https://relay.example")!, transport: { request, _, _, _ in
     expect(request.url?.path == "/api/v1/playlists/PL1", "the fallback lists the same playlist")
     return try JSONSerialization.data(withJSONObject: ["title": "Резерв", "author": "Канал",

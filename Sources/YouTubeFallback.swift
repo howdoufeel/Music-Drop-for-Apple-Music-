@@ -90,6 +90,26 @@ final class YouTubeFallback {
                                  author: clean(root["author"] as? String ?? "YouTube"), tracks: tracks)
     }
 
+    func searchVideos(_ query: String, cancellation: SoundCloudCancellation) throws -> YouTubeCollection {
+        var components = URLComponents(url: endpoint.appendingPathComponent("api/v1/search"), resolvingAgainstBaseURL: false)!
+        components.queryItems = [URLQueryItem(name: "q", value: query), URLQueryItem(name: "type", value: "video")]
+        let data = try transport(Self.request(components.url!), cancellation, 5_000_000, nil)
+        func clean(_ text: String) -> String {
+            String(text.unicodeScalars.map { CharacterSet.controlCharacters.contains($0) ? " " : String($0) }.joined()
+                .trimmingCharacters(in: .whitespacesAndNewlines).prefix(400))
+        }
+        var seen: Set<String> = []
+        let tracks: [YouTubeTrack] = ((try JSONSerialization.jsonObject(with: data)) as? [[String: Any]] ?? []).prefix(20).compactMap { video in
+            guard video["type"] as? String ?? "video" == "video", let id = video["videoId"] as? String,
+                  (try? YouTubeService.videoID("https://youtu.be/" + id)) == id, seen.insert(id).inserted,
+                  let title = video["title"] as? String, !title.isEmpty else { return nil }
+            let tags = TrackMetadata.youTube(title: clean(title), channel: clean(video["author"] as? String ?? ""), artist: nil, track: nil)
+            return YouTubeTrack(id: id, title: tags.title, artist: tags.artist, duration: video["lengthSeconds"] as? Double)
+        }
+        guard !tracks.isEmpty else { throw DropError.message("На YouTube ничего не нашлось.") }
+        return YouTubeCollection(id: "search", title: "Поиск: " + query, author: "YouTube", tracks: tracks, isSearch: true)
+    }
+
     static func request(_ url: URL) -> URLRequest {
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 20)
         request.setValue("MusicDrop/1.5.1", forHTTPHeaderField: "User-Agent")

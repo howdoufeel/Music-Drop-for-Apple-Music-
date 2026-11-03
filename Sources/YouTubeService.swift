@@ -54,6 +54,8 @@ struct YouTubeCollection: Equatable {
     let title: String
     let author: String
     var tracks: [YouTubeTrack]
+    /// Search results are shown like a playlist but never become one.
+    var isSearch = false
     var url: URL { URL(string: "https://www.youtube.com/playlist?list=" + id)! }
 }
 
@@ -68,11 +70,16 @@ protocol YouTubeProviding {
                   stage: @escaping (String) -> Void, progress: @escaping (Double) -> Void) throws -> URL
     /// The videos of a playlist ID accepted by `playlistID`.
     func playlist(_ id: String, cancellation: SoundCloudCancellation) throws -> YouTubeCollection
+    /// Videos matching words, for when there is no link to paste.
+    func searchVideos(_ query: String, cancellation: SoundCloudCancellation) throws -> YouTubeCollection
 }
 
 extension YouTubeProviding {
     func playlist(_ id: String, cancellation: SoundCloudCancellation) throws -> YouTubeCollection {
         throw DropError.message("Плейлисты YouTube здесь не поддерживаются.")
+    }
+    func searchVideos(_ query: String, cancellation: SoundCloudCancellation) throws -> YouTubeCollection {
+        throw DropError.message("Поиск YouTube здесь не поддерживается.")
     }
     func preview(_ input: String, cancellation: SoundCloudCancellation) -> YouTubeTrack? { nil }
     func download(_ track: YouTubeTrack, directory: URL, cancellation: SoundCloudCancellation,
@@ -360,6 +367,25 @@ final class YouTubeService: YouTubeProviding {
             guard let fallback else { throw error }
             return try fallback.playlist(id, cancellation: cancellation)
         }
+    }
+
+    /// A flat search lists titles only, so twenty results arrive in about the time of one video check.
+    func searchVideos(_ query: String, cancellation: SoundCloudCancellation) throws -> YouTubeCollection {
+        let words = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !words.isEmpty, words.count <= 300, !words.contains("\0") else { throw DropError.message("Введи название трека или исполнителя.") }
+        var result: YouTubeCollection
+        do {
+            try validateTools(needsEncoder: false)
+            let data = try run(helper, arguments: arguments.filter { $0 != "--no-playlist" } + ["--flat-playlist", "--dump-single-json",
+                                                  "--", "ytsearch20:" + words],
+                               cancellation: cancellation, timeout: 60)
+            result = try Self.parsePlaylist(data, expectedID: "search")
+        } catch {
+            if cancellation.isCancelled { throw SoundCloudError.cancelled }
+            guard let fallback else { throw error }
+            result = try fallback.searchVideos(words, cancellation: cancellation)
+        }
+        return YouTubeCollection(id: "search", title: "Поиск: " + words, author: "YouTube", tracks: result.tracks, isSearch: true)
     }
 
     /// One extractor run per video: the check and the later download share its result,
