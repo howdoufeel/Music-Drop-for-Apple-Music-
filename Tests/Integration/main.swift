@@ -239,6 +239,43 @@ do {
     settle(slowStore)
 }
 
+// While tracks download, Music is launched for them and kept free of cloud work.
+do {
+    let musicLock = NSLock()
+    var downloading = true, musicRunning = false
+    var prepareCalls = 0, statusCalls = 0, deferredCloudCalls = 0
+    var busyServices = services
+    busyServices.musicIsRunning = { musicLock.lock(); defer { musicLock.unlock() }; return musicRunning }
+    busyServices.prepareMusic = {
+        Thread.sleep(forTimeInterval: 0.1)
+        musicLock.lock(); prepareCalls += 1; musicRunning = true; musicLock.unlock()
+    }
+    busyServices.cloudStatus = { _ in musicLock.lock(); statusCalls += 1; musicLock.unlock(); return "not uploaded" }
+    busyServices.updateCloudLibrary = { musicLock.lock(); deferredCloudCalls += 1; musicLock.unlock() }
+    let busyStore = ImportStore(directory: root.appendingPathComponent("BusyMusic"), services: busyServices, startTimer: false)
+    busyStore.downloadsActive = { downloading }
+    busyStore.prepareMusic(); busyStore.prepareMusic()
+    expect(busyStore.musicStarting, "Music starts launching as soon as a download begins")
+    let launchDeadline = Date().addingTimeInterval(3)
+    while busyStore.musicStarting, Date() < launchDeadline { RunLoop.main.run(until: Date().addingTimeInterval(0.01)) }
+    expect(prepareCalls == 1 && musicRunning && !busyStore.musicStarting, "repeated download starts launch Music only once")
+    busyStore.prepareMusic()
+    expect(!busyStore.musicStarting && prepareCalls == 1, "a running Music is not prepared again")
+    let downloadedEarly = root.appendingPathComponent("busy-first.mp3")
+    try Data("busy-first".utf8).write(to: downloadedEarly)
+    busyStore.accept([downloadedEarly])
+    settle(busyStore)
+    expect(busyStore.entries[0].stage == .imported && deferredCloudCalls == 0 && busyStore.cloudWaitingCount == 1,
+           "an import finished during other downloads leaves the cloud request for later")
+    busyStore.refreshCloud(); busyStore.cloudSyncTick()
+    expect(!busyStore.refreshInProgress && statusCalls == 0, "cloud status reads wait while tracks are downloading")
+    downloading = false
+    busyStore.downloadsFinished()
+    settle(busyStore)
+    expect(deferredCloudCalls == 1 && busyStore.entries[0].cloudUpdateRequestedAt != nil,
+           "the deferred cloud request runs once the last download finishes")
+}
+
 // Music Drop's own finished downloads move into the library folder and leave no staging behind.
 do {
     let moveRoot = root.appendingPathComponent("MoveState")

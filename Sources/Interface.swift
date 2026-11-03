@@ -326,8 +326,8 @@ private struct HistoryRow: View {
     private var subtitle: String {
         if store.updatingFavorites.contains(entry.id) { return "Добавляем в избранное…" }
         switch entry.stage {
-        case .queued: return "В очереди"
-        case .importing: return "Добавляем в медиатеку и избранное…"
+        case .queued: return store.musicStarting ? "Ждём запуска «Музыки»…" : "В очереди"
+        case .importing: return store.musicStarting ? "Запускаем «Музыку»…" : "Добавляем в медиатеку и избранное…"
         case .failed: return "Не удалось добавить"
         case .needsReview: return "Нужно проверить медиатеку"
         case .imported:

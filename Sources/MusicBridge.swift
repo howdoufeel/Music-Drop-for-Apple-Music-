@@ -128,9 +128,21 @@ enum MusicBridge {
         }
     }
 
+    /// Launches Music and waits until it answers scripts, so an import that follows
+    /// does not also pay for the launch.
+    static func prepare() throws {
+        try ensureRunning()
+        _ = try execute("""
+        with timeout of 60 seconds
+            tell application id "com.apple.Music" to get version
+        end timeout
+        """)
+    }
+
     static func cloudStatus(id: String) throws -> String {
+        // A status read is never urgent; a short timeout keeps a busy Music from holding imports back.
         try execute("""
-        with timeout of 10 seconds
+        with timeout of 4 seconds
             tell application id "com.apple.Music"
                 set foundTracks to (every file track of library playlist 1 whose persistent ID is \(FileTools.appleScriptLiteral(id)))
                 if (count of foundTracks) is 0 then return "missing"

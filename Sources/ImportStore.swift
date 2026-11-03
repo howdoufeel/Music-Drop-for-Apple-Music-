@@ -24,6 +24,7 @@ struct ImportServices {
     var updateCloudLibrary: () throws -> Void = CloudUpdateBridge.requestUpdate
     var cloudAccessGranted: () -> Bool = { CloudUpdateBridge.isTrusted }
     var musicIsRunning: () -> Bool = { !NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.Music").isEmpty }
+    var prepareMusic: () throws -> Void = MusicBridge.prepare
 }
 
 /// Coalesces history writes off the main thread; the newest snapshot always wins.
@@ -61,6 +62,8 @@ private final class HistoryWriter {
     var lastRefresh: Date?
     var updatingFavorites: Set<UUID> = []
     var cloudUpdateInProgress = false
+    /// Music is launching for an import or a download that will need it.
+    var musicStarting = false
     // Derived from entries once per change, so views and timers never rescan the history.
     private(set) var activeImportCount = 0
     private(set) var successfulCount = 0
@@ -82,6 +85,9 @@ private final class HistoryWriter {
     private let now: () -> Date
     @ObservationIgnored private var cloudPollOffset = 0
     @ObservationIgnored var onActivity: ((Bool) -> Void)?
+    /// True while SoundCloud or YouTube audio is downloading: its import comes next, so Music is
+    /// kept free of status reads and cloud requests until then.
+    @ObservationIgnored var downloadsActive: () -> Bool = { false }
 
     var activeCount: Int {
         activeImportCount + updatingFavorites.count + (cloudUpdateInProgress ? 1 : 0)
@@ -316,9 +322,29 @@ private final class HistoryWriter {
         }
     }
 
-    private func performImport(_ entry: ImportEntry) {
+    /// Called when a download starts: Music launches while the audio is still downloading.
+    func prepareMusic() {
+        guard !preview, !musicStarting, !services.musicIsRunning() else { return }
+        musicStarting = true
         queue.async { [weak self] in
             guard let self else { return }
+            let started = Date()
+            try? self.services.prepareMusic()
+            NSLog("Music Drop: Music ready for imports after %.2f s", Date().timeIntervalSince(started))
+            DispatchQueue.main.async { self.musicStarting = false }
+        }
+    }
+
+    /// Called when the last download finishes, so the deferred cloud request can run.
+    func downloadsFinished() {
+        beginCloudUpdate()
+    }
+
+    private func performImport(_ entry: ImportEntry) {
+        let enqueued = Date()
+        queue.async { [weak self] in
+            guard let self else { return }
+            let started = Date()
             DispatchQueue.main.sync { self.update(entry.id) { $0.stage = .importing } }
             let source = URL(fileURLWithPath: entry.managedPath ?? entry.sourcePath)
             let access = source.startAccessingSecurityScopedResource()
@@ -359,8 +385,21 @@ private final class HistoryWriter {
                 DispatchQueue.main.sync {
                     self.update(entry.id) { $0.digest = digest; $0.managedPath = managed.path }
                 }
-                let result = try self.services.add(managed)
+                let launching = !self.services.musicIsRunning()
+                if launching { DispatchQueue.main.async { self.musicStarting = true } }
+                let adding = Date()
+                let result: MusicResult
+                do { result = try self.services.add(managed) }
+                catch {
+                    if launching { DispatchQueue.main.async { self.musicStarting = false } }
+                    throw error
+                }
+                // Timings in Console.app (process "Music Drop") show where an import waited.
+                NSLog("Music Drop import: queued %.2f s, file checks %.2f s, Music %.2f s, Music launched: %d",
+                      started.timeIntervalSince(enqueued), adding.timeIntervalSince(started), Date().timeIntervalSince(adding),
+                      launching ? 1 : 0)
                 DispatchQueue.main.async {
+                    if launching { self.musicStarting = false }
                     self.update(entry.id) {
                         $0.trackID = result.id; $0.title = result.title
                         $0.cloudStatus = result.cloudStatus; $0.stage = .imported; $0.error = nil
@@ -398,7 +437,7 @@ private final class HistoryWriter {
 
     /// The helper runs on its own queue, so a slow menu request never delays the next import.
     private func beginCloudUpdate() {
-        guard !pendingCloudUpdateIDs.isEmpty, !cloudUpdateInProgress, activeImportCount == 0 else { return }
+        guard !pendingCloudUpdateIDs.isEmpty, !cloudUpdateInProgress, activeImportCount == 0, !downloadsActive() else { return }
         cloudUpdateInProgress = true
         onActivity?(true)
         let affected = pendingCloudUpdateIDs
@@ -458,7 +497,7 @@ private final class HistoryWriter {
     }
 
     func refreshCloud() {
-        guard !preview, !refreshInProgress, activeCount == 0,
+        guard !preview, !refreshInProgress, activeCount == 0, !downloadsActive(),
               services.musicIsRunning() else { return }
         // Bound each poll; prefer tracks whose cloud result is still pending.
         let imported = entries.filter { $0.stage == .imported && $0.trackID != nil }
@@ -475,8 +514,9 @@ private final class HistoryWriter {
             var updates: [UUID: String] = [:]
             var failure: String?
             for entry in selected {
+                // Stop at once when an import is queued or a download will soon need Music.
                 var hasPendingImports = false
-                DispatchQueue.main.sync { hasPendingImports = self.activeCount > 0 }
+                DispatchQueue.main.sync { hasPendingImports = self.activeCount > 0 || self.downloadsActive() }
                 if hasPendingImports { break }
                 do { updates[entry.id] = try self.services.cloudStatus(entry.trackID!) }
                 catch { failure = error.localizedDescription; break }

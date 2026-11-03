@@ -141,7 +141,8 @@ struct SoundCloudPanel: View {
                 Text(error).font(.system(size: 11)).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true).padding(.leading, 54)
             } else if let entry {
-                Text(entry.stage == .imported ? CloudState.label(entry.cloudStatus) : "Импортируем в «Музыку»…")
+                Text(entry.stage == .imported ? CloudState.label(entry.cloudStatus)
+                     : imports.musicStarting ? "Запускаем «Музыку»…" : "Импортируем в «Музыку»…")
                     .font(.system(size: 10)).foregroundStyle(.secondary).padding(.leading, 54)
             }
             if let entry, let problem = entry.favoriteError {

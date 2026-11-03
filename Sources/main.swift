@@ -57,6 +57,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
     var youtube: YouTubeStore!
     var navigation: PanelNavigation!
     let previewPlayer = PreviewPlayer()
+    private var wasDownloading = false
     var previewWindow: NSWindow?
     var globalMonitor: Any?
     var localMonitor: Any?
@@ -102,6 +103,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
             button.addSubview(target)
         }
         store.onActivity = { [weak self] _ in self?.updateActivity() }
+        store.downloadsActive = { [weak self] in self.map { $0.soundCloud.isDownloading || $0.youtube.isDownloading } ?? false }
         popover.behavior = .transient
         popover.animates = !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         popover.delegate = self
@@ -206,7 +208,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
     }
 
     func updateActivity() {
-        updateIcon(busy: store.activeCount > 0 || soundCloud.isDownloading || youtube.isDownloading)
+        let downloading = soundCloud.isDownloading || youtube.isDownloading
+        updateIcon(busy: store.activeCount > 0 || downloading)
+        // Music gets ready while the audio downloads; cloud work waits for the last download.
+        if downloading { store.prepareMusic() }
+        if wasDownloading, !downloading { store.downloadsFinished() }
+        wasDownloading = downloading
     }
 
     func show(activate: Bool = true) {

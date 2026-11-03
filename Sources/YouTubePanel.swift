@@ -91,7 +91,10 @@ struct YouTubePanel: View {
                 }
             } else if let entry {
                 if entry.stage == .queued || entry.stage == .importing {
-                    HStack { ProgressView().controlSize(.small); Text("Добавляем в медиатеку и избранное…").font(.system(size: 11)) }
+                    HStack {
+                        ProgressView().controlSize(.small)
+                        Text(imports.musicStarting ? "Запускаем «Музыку»…" : "Добавляем в медиатеку и избранное…").font(.system(size: 11))
+                    }
                 } else if entry.stage == .imported {
                     Label(CloudState.label(entry.cloudStatus), systemImage: entry.isFavorite == true ? "star.fill" : "checkmark.circle")
                         .font(.system(size: 11)).foregroundStyle(.secondary)
