@@ -353,6 +353,9 @@ final class SoundCloudSearchClient {
             if let artist = publisher["artist"] as? String, !artist.isEmpty { track["artist"] = artist }
             if let milliseconds = item["duration"] as? Double { track["duration"] = milliseconds / 1000 }
             track["thumbnail"] = item["artwork_url"] as? String ?? user["avatar_url"] as? String
+            track["genre"] = item["genre"] as? String
+            track["release_year"] = TrackMetadata.year(item["release_date"] ?? item["display_date"] ?? item["created_at"])
+            track["album"] = publisher["release_title"] as? String ?? publisher["album_title"] as? String
             return track
         }
         var hints: [String: SoundCloudStreamHint] = [:]

@@ -950,6 +950,35 @@ if CommandLine.arguments.count > 1 {
     let unsupportedService = SoundCloudService(helper: root.appendingPathComponent("no-helper"), ffmpeg: noFFmpeg, cache: nativeCache, searchClient: audioClient)
     do { _ = try unsupportedService.download(nativeResults[0], directory: root.appendingPathComponent("NeedsFFmpeg"), cancellation: SoundCloudCancellation(), stage: { _ in }); fatalError("Unsupported stream accepted") }
     catch { expect(error.localizedDescription.contains("FFmpeg"), "a stream AVFoundation cannot rewrap asks for FFmpeg by name") }
+
+    // Cover art and tags end up inside the prepared file.
+    let coverFile = root.appendingPathComponent("cover-source.jpg")
+    let painter = Process()
+    painter.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/ffmpeg")
+    painter.arguments = ["-nostdin", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "color=c=orange:s=640x360", "-frames:v", "1", coverFile.path]
+    try painter.run(); painter.waitUntilExit()
+    let coverJPEG = try Data(contentsOf: coverFile)
+    func probe(_ file: URL) -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/ffprobe")
+        process.arguments = ["-v", "error", "-show_entries", "stream=codec_type,width,height:stream_disposition=attached_pic:format_tags", "-of", "flat", file.path]
+        let pipe = Pipe(); process.standardOutput = pipe
+        try? process.run(); process.waitUntilExit()
+        return String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+    }
+    var artworkRequests: [[URL]] = []
+    let artService = SoundCloudService(helper: root.appendingPathComponent("no-helper"), ffmpeg: noFFmpeg, cache: nativeCache, searchClient: realClient,
+                                       artwork: { urls, _ in artworkRequests.append(urls); return coverJPEG })
+    var artTrack = nativeResults[0]
+    artTrack.genre = "House"; artTrack.year = 2021; artTrack.album = "Альбом"
+    let artFile = try artService.download(artTrack, directory: root.appendingPathComponent("ArtHLS"), cancellation: SoundCloudCancellation(), stage: { _ in })
+    let artProbe = probe(artFile)
+    expect(artProbe.contains("attached_pic=1") && artProbe.lowercased().contains("genre=\"house\"") && artProbe.contains("2021")
+           && artProbe.contains("Альбом"), "a SoundCloud M4A carries its cover, genre, year and release")
+    expect(artworkRequests.first?.first?.absoluteString.contains("t500x500") == true, "the large SoundCloud artwork is requested first")
+    #if canImport(ImageIO)
+    expect(artProbe.contains("width=360") && artProbe.contains("height=360"), "a wide picture is cropped to a square cover")
+    #endif
 }
 
 func waitUI(_ predicate: () -> Bool) {
@@ -1195,6 +1224,28 @@ if CommandLine.arguments.count > 1 {
     let mp3WithoutFFmpeg = YouTubeService(helper:helperYT,ffmpeg:missingFFmpeg,runtime:URL(fileURLWithPath:"/usr/bin/true"),cache:root.appendingPathComponent("YTNoMP3"),fallback:nil,format:{ .mp3 })
     do { _ = try mp3WithoutFFmpeg.download(ytTrack,directory:root.appendingPathComponent("YTNoMP3Download"),cancellation:SoundCloudCancellation(),stage:{ _ in }); fatalError("MP3 without encoder") }
     catch { expect(error.localizedDescription.contains("FFmpeg") && error.localizedDescription.contains("M4A"), "MP3 mode without FFmpeg points to M4A or installing FFmpeg") }
+    let ytCover = root.appendingPathComponent("yt-cover.jpg")
+    let ytPainter = Process()
+    ytPainter.executableURL = ffmpegYT
+    ytPainter.arguments = ["-nostdin", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "color=c=red:s=1280x720", "-frames:v", "1", ytCover.path]
+    try ytPainter.run(); ytPainter.waitUntilExit()
+    let ytCoverJPEG = try Data(contentsOf: ytCover)
+    func ytProbe(_ file: URL) -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/ffprobe")
+        process.arguments = ["-v", "error", "-show_entries", "stream=codec_type:stream_disposition=attached_pic:format_tags", "-of", "flat", file.path]
+        let pipe = Pipe(); process.standardOutput = pipe
+        try? process.run(); process.waitUntilExit()
+        return String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+    }
+    for (format, name) in [(YouTubeAudioFormat.mp3, "YTArtMP3"), (YouTubeAudioFormat.m4a, "YTArtM4A")] {
+        let artYT = YouTubeService(helper:helperYT,ffmpeg:ffmpegYT,runtime:URL(fileURLWithPath:"/usr/bin/true"),cache:root.appendingPathComponent(name),
+                                   fallback:nil,format:{ format },artwork:{ _, _ in ytCoverJPEG })
+        let artFileYT = try artYT.download(ytTrack,directory:root.appendingPathComponent(name + "Download"),cancellation:SoundCloudCancellation(),stage:{ _ in })
+        let probed = ytProbe(artFileYT)
+        expect(probed.contains("attached_pic=1") && probed.contains("Трек / один") && probed.contains("Автор"),
+               "a YouTube \(format.label) file carries its cover, title and artist")
+    }
     // With a direct stream in the extractor's JSON, the audio comes straight from Google's servers.
     GoogleVideoFixture.payload = try Data(contentsOf: fixtureYT)
     let directLog = root.appendingPathComponent("yt-direct-arguments")
@@ -1460,6 +1511,49 @@ YouTubeHTTPFixture.status = 429
 let limitedFile = root.appendingPathComponent("limited.m4a")
 do { _ = try YouTubeHTTPTransfer.run(credentialRequest,cancellation:SoundCloudCancellation(),maximumBytes:100,destination:limitedFile,endpoint:relayEndpoint,configuration:httpFixtureConfig);fatalError("Rate limit accepted") }
 catch { expect((error as? YouTubeHTTPError)?.status == 429 && !FileManager.default.fileExists(atPath:limitedFile.path),"rate limits stop the transfer and never save an error page as audio") }
+
+// Upload titles become the title and artist a library expects.
+let vevo = TrackMetadata.youTube(title: "Daft Punk - Get Lucky (Official Video) [4K]", channel: "DaftPunkVEVO", artist: nil, track: nil)
+expect(vevo.title == "Get Lucky" && vevo.artist == "Daft Punk", "an 'Artist - Song (Official Video) [4K]' upload is split and cleaned")
+let topic = TrackMetadata.youTube(title: "Instant Crush", channel: "Daft Punk - Topic", artist: nil, track: nil)
+expect(topic.title == "Instant Crush" && topic.artist == "Daft Punk", "an auto-generated Topic channel names the artist")
+let described = TrackMetadata.youTube(title: "Whatever (Official Audio)", channel: "Label", artist: "Artist", track: "Song (feat. Guest)")
+expect(described.title == "Song (feat. Guest)" && described.artist == "Artist", "YouTube's own music metadata wins over the upload title")
+let musical = TrackMetadata.youTube(title: "Song (Remix) (Live)", channel: "Band", artist: nil, track: nil)
+expect(musical.title == "Song (Remix) (Live)" && musical.artist == "Band", "words about the music itself are kept")
+let barred = TrackMetadata.youTube(title: "Песня | Official Video", channel: "Канал", artist: nil, track: nil)
+let russian = TrackMetadata.youTube(title: "Группа - Песня (Официальный клип)", channel: "Канал", artist: nil, track: nil)
+expect(barred.title == "Песня" && barred.artist == "Канал" && russian.title == "Песня" && russian.artist == "Группа",
+       "a trailing '| Official Video' and Russian clip labels are removed")
+let soundCloudPrefix = TrackMetadata.soundCloud(title: "Artist - Song", artist: "Artist")
+let soundCloudMix = TrackMetadata.soundCloud(title: "Song - Extended Mix", artist: "Artist")
+expect(soundCloudPrefix.title == "Song" && soundCloudMix.title == "Song - Extended Mix",
+       "SoundCloud drops only a repeated artist prefix and keeps mix names")
+expect(TrackMetadata.year("2024-05-01T00:00:00Z") == 2024 && TrackMetadata.year("20190102") == 2019 && TrackMetadata.year("soon") == nil,
+       "years are read from release and upload dates")
+let tagSample = AudioTags(title: "T", artist: "A", album: "B", comment: "C", genre: "House", year: 2021)
+let plainTagArguments = tagSample.ffmpegArguments(cover: nil)
+let coverTagArguments = tagSample.ffmpegArguments(cover: URL(fileURLWithPath: "/tmp/cover.jpg"))
+expect(plainTagArguments.inputs.isEmpty && plainTagArguments.outputs.contains("-vn") && plainTagArguments.outputs.contains("genre=House")
+       && plainTagArguments.outputs.contains("date=2021"), "FFmpeg tags include genre and year and drop video without a cover")
+expect(coverTagArguments.inputs == ["-i", "/tmp/cover.jpg"] && coverTagArguments.outputs.contains("attached_pic") && !coverTagArguments.outputs.contains("-vn"),
+       "a cover is attached as the album picture")
+expect(CoverArt.soundCloudURLs(URL(string: "https://i1.sndcdn.com/artworks-abc-large.jpg")).first?.lastPathComponent == "artworks-abc-t500x500.jpg"
+       && CoverArt.youTubeURLs(ytID).first?.lastPathComponent == "maxresdefault.jpg" && !CoverArt.isAllowed(URL(string: "https://example.com/a.jpg")!),
+       "artwork comes in its large size and only from SoundCloud and YouTube image hosts")
+var taggedTrack = nativeTrack
+taggedTrack["title"] = "Исполнитель - Трек"
+taggedTrack["genre"] = "House"
+taggedTrack["release_date"] = "2021-03-04T00:00:00Z"
+taggedTrack["publisher_metadata"] = ["artist": "Исполнитель", "release_title": "Альбом"]
+let tagged = try SoundCloudSearchClient.parse(JSONSerialization.data(withJSONObject: ["collection": [taggedTrack]]))[0]
+expect(tagged.title == "Трек" && tagged.artist == "Исполнитель" && tagged.genre == "House" && tagged.year == 2021 && tagged.album == "Альбом",
+       "SoundCloud results carry clean titles, genre, year and release")
+let musicJSON = try JSONSerialization.data(withJSONObject: ["id": ytID, "title": "Ignored (Official Video)", "channel": "LabelVEVO",
+                                                            "artist": "Artist", "track": "Song", "album": "Record", "release_year": 2020])
+let musicTrack = try YouTubeService.parseTrack(musicJSON, expectedID: ytID)
+expect(musicTrack.title == "Song" && musicTrack.artist == "Artist" && musicTrack.album == "Record" && musicTrack.year == 2020,
+       "YouTube music uploads keep their song, artist, album and year")
 
 // Links from any field, paste or drop go to the source they belong to.
 expect(LinkRoute.detect("https://youtu.be/\(ytID)?si=share") == .youTube("https://youtu.be/\(ytID)?si=share")

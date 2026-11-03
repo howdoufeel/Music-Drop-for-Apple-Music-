@@ -113,7 +113,8 @@ final class YouTubeFallback {
             String(text.unicodeScalars.map { CharacterSet.controlCharacters.contains($0) ? " " : String($0) }.joined()
                 .trimmingCharacters(in: .whitespacesAndNewlines).prefix(400))
         }
-        let track = YouTubeTrack(id: expectedID, title: clean(title), artist: clean(root["author"] as? String ?? "YouTube"),
+        let tags = TrackMetadata.youTube(title: clean(title), channel: clean(root["author"] as? String ?? ""), artist: nil, track: nil)
+        let track = YouTubeTrack(id: expectedID, title: tags.title, artist: tags.artist,
                                  duration: root["lengthSeconds"] as? Double, fallbackEndpoint: endpoint)
         return YouTubeFallbackInfo(track: track, audioURL: best.0, fileExtension: best.1)
     }

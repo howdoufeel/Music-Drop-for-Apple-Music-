@@ -37,7 +37,7 @@ import Observation
     @ObservationIgnored var onPreview: ((URL?) -> Void)?
     var isDownloading: Bool { !downloadStates.isEmpty }
 
-    init(service: SoundCloudProviding = SoundCloudService(), directory: URL? = nil, preview: Bool = false) {
+    init(service: SoundCloudProviding = SoundCloudService(artwork: CoverArt.load), directory: URL? = nil, preview: Bool = false) {
         self.service = service
         self.preview = preview
         self.directory = directory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]

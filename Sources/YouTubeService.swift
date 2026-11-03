@@ -8,6 +8,8 @@ struct YouTubeTrack: Identifiable, Equatable {
     var url: URL { URL(string: "https://www.youtube.com/watch?v=" + id)! }
     var duration: Double?
     var fallbackEndpoint: URL?
+    var album: String?
+    var year: Int?
     var durationLabel: String {
         guard let duration, duration.isFinite, duration >= 0 else { return "" }
         let seconds = Int(min(duration, 864_000))
@@ -78,10 +80,14 @@ final class YouTubeService: YouTubeProviding {
     private let format: () -> YouTubeAudioFormat
     private let transferConfiguration: URLSessionConfiguration?
     private let raceDelay: () -> TimeInterval?
+    private let artwork: (([URL], SoundCloudCancellation) -> Data?)?
+    /// `artwork` loads cover art for tagging; without it files get no picture.
     init(helper: URL? = nil, ffmpeg: URL? = nil, runtime: URL? = nil, cache: URL? = nil,
          fallback: YouTubeFallback? = YouTubeFallback(), format: @escaping () -> YouTubeAudioFormat = { .stored },
          transferConfiguration: URLSessionConfiguration? = nil,
-         raceDelay: @escaping () -> TimeInterval? = { YouTubeFallbackRace.storedDelay }) {
+         raceDelay: @escaping () -> TimeInterval? = { YouTubeFallbackRace.storedDelay },
+         artwork: (([URL], SoundCloudCancellation) -> Data?)? = nil) {
+        self.artwork = artwork
         self.fallback = fallback
         self.format = format
         self.transferConfiguration = transferConfiguration
@@ -129,7 +135,8 @@ final class YouTubeService: YouTubeProviding {
             String(text.unicodeScalars.map { CharacterSet.controlCharacters.contains($0) ? " " : String($0) }.joined()
                 .trimmingCharacters(in: .whitespacesAndNewlines).prefix(400))
         }
-        return YouTubeTrack(id: expectedID, title: clean(title), artist: clean(item["author_name"] as? String ?? "YouTube"))
+        let tags = TrackMetadata.youTube(title: clean(title), channel: clean(item["author_name"] as? String ?? ""), artist: nil, track: nil)
+        return YouTubeTrack(id: expectedID, title: tags.title, artist: tags.artist)
     }
 
     static func isGoogleVideo(_ url: URL) -> Bool {
@@ -172,9 +179,13 @@ final class YouTubeService: YouTubeProviding {
             String(text.unicodeScalars.map { CharacterSet.controlCharacters.contains($0) ? " " : String($0) }.joined()
                 .trimmingCharacters(in: .whitespacesAndNewlines).prefix(400))
         }
-        return YouTubeTrack(id: expectedID, title: clean(title),
-                            artist: clean((item["artist"] as? String) ?? (item["uploader"] as? String) ?? "YouTube"),
-                            duration: item["duration"] as? Double)
+        // yt-dlp names the artist and song for music uploads; otherwise the title and channel are read.
+        let artist = (item["artist"] as? String) ?? (item["artists"] as? [String])?.joined(separator: ", ") ?? (item["creator"] as? String)
+        let tags = TrackMetadata.youTube(title: clean(title), channel: clean((item["channel"] as? String) ?? (item["uploader"] as? String) ?? ""),
+                                         artist: artist.map(clean), track: (item["track"] as? String).map(clean))
+        return YouTubeTrack(id: expectedID, title: tags.title, artist: tags.artist, duration: item["duration"] as? Double,
+                            album: (item["album"] as? String).map(clean)?.nonEmpty,
+                            year: TrackMetadata.year(item["release_year"] ?? item["release_date"] ?? item["upload_date"]))
     }
 
     private var arguments: [String] {
@@ -340,6 +351,8 @@ final class YouTubeService: YouTubeProviding {
         try FileManager.default.createDirectory(at: working, withIntermediateDirectories: true)
         var success = false
         defer { if !success { try? FileManager.default.removeItem(at: working) } }
+        // The cover downloads alongside the audio and is ready by the time the file is tagged.
+        let cover = artwork.map { load in PendingResult { load(CoverArt.youTubeURLs(track.id), cancellation) } }
         let source: URL
         if let endpoint = track.fallbackEndpoint {
             guard let fallback, endpoint == fallback.endpoint else { throw DropError.message("Неизвестный резервный сервис.") }
@@ -359,7 +372,11 @@ final class YouTubeService: YouTubeProviding {
             }
         }
         try FileTools.validate(source, allowedExtensions: ["m4a", "webm", "mp4", "opus", "ogg", "mp3", "aac"])
-        let prepared = try prepare(source, track: track, format: format, working: working, ffmpeg: ffmpeg,
+        // The extractor's metadata is fuller than a quick card's, so it wins when it is known.
+        let described = describedTrack(track, format: format)
+        let tags = AudioTags(title: described.title, artist: described.artist, album: described.album ?? described.title,
+                             comment: track.url.absoluteString, year: described.year, artwork: cover?.value(waiting: 5))
+        let prepared = try prepare(source, track: track, format: format, working: working, ffmpeg: ffmpeg, tags: tags,
                                    cancellation: cancellation, stage: stage)
         try FileTools.validate(prepared, allowedExtensions: ["mp3", "m4a"])
         let size = try prepared.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
@@ -455,8 +472,14 @@ final class YouTubeService: YouTubeProviding {
         return downloaded
     }
 
-    private func prepare(_ source: URL, track: YouTubeTrack, format: YouTubeAudioFormat, working: URL, ffmpeg: URL?,
+    private func describedTrack(_ track: YouTubeTrack, format: YouTubeAudioFormat) -> YouTubeTrack {
+        routeLock.lock(); defer { routeLock.unlock() }
+        return infos[track.id + "|" + format.rawValue]?.info.track ?? track
+    }
+
+    private func prepare(_ source: URL, track: YouTubeTrack, format: YouTubeAudioFormat, working: URL, ffmpeg: URL?, tags: AudioTags,
                          cancellation: SoundCloudCancellation, stage: @escaping (String) -> Void) throws -> URL {
+        let cover = tags.coverFile(in: working)
         let preparedDirectory = working.appendingPathComponent("Prepared", isDirectory: true)
         try FileManager.default.createDirectory(at: preparedDirectory, withIntermediateDirectories: true)
         let cleaned = track.title.unicodeScalars.map { "/:\0".unicodeScalars.contains($0) ? "_" : String($0) }.joined()
@@ -467,22 +490,23 @@ final class YouTubeService: YouTubeProviding {
             guard let ffmpeg else { throw DropError.message(Self.ffmpegNeeded) }
             stage("Сохраняем MP3…")
             let prepared = preparedDirectory.appendingPathComponent(base + ".mp3")
-            _ = try run(ffmpeg, arguments: Self.encodeArguments(source: source, output: prepared, track: track), cancellation: cancellation, timeout: 300)
+            _ = try run(ffmpeg, arguments: Self.encodeArguments(source: source, output: prepared, track: track, tags: tags, cover: cover),
+                        cancellation: cancellation, timeout: 300)
             return prepared
         }
         let prepared = preparedDirectory.appendingPathComponent(base + ".m4a")
         if ["m4a", "mp4", "aac"].contains(source.pathExtension.lowercased()) {
             stage("Сохраняем M4A без перекодирования…")
             do {
-                try AudioRemux.m4a(from: source, to: prepared, tags: AudioTags(title: track.title, artist: track.artist, album: "YouTube",
-                                                                               comment: track.url.absoluteString), cancellation: cancellation)
+                try AudioRemux.m4a(from: source, to: prepared, tags: tags, cancellation: cancellation)
                 return prepared
             } catch {
                 if cancellation.isCancelled { throw SoundCloudError.cancelled }
             }
             if let ffmpeg {
                 do {
-                    _ = try run(ffmpeg, arguments: Self.m4aArguments(source: source, output: prepared, track: track, codec: ["-c:a", "copy"]),
+                    _ = try run(ffmpeg, arguments: Self.m4aArguments(source: source, output: prepared, track: track, codec: ["-c:a", "copy"],
+                                                                     tags: tags, cover: cover),
                                 cancellation: cancellation, timeout: 300)
                     return prepared
                 } catch {
@@ -497,29 +521,39 @@ final class YouTubeService: YouTubeProviding {
         do {
             // AudioToolbox is Apple's own AAC encoder: fast and transparent at this bitrate.
             _ = try run(ffmpeg, arguments: Self.m4aArguments(source: source, output: prepared, track: track,
-                                                             codec: ["-c:a", "aac_at", "-b:a", "256k"]),
+                                                             codec: ["-c:a", "aac_at", "-b:a", "256k"], tags: tags, cover: cover),
                         cancellation: cancellation, timeout: 300)
         } catch {
             if cancellation.isCancelled { throw SoundCloudError.cancelled }
             _ = try run(ffmpeg, arguments: Self.m4aArguments(source: source, output: prepared, track: track,
-                                                             codec: ["-c:a", "aac", "-b:a", "256k"]),
+                                                             codec: ["-c:a", "aac", "-b:a", "256k"], tags: tags, cover: cover),
                         cancellation: cancellation, timeout: 300)
         }
         return prepared
     }
 
-    static func m4aArguments(source: URL, output: URL, track: YouTubeTrack, codec: [String]) -> [String] {
-        ["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", source.path, "-map", "0:a:0", "-vn"]
-            + codec + ["-fs", "200000001",
-                       "-metadata", "title=" + track.title, "-metadata", "artist=" + track.artist,
-                       "-metadata", "album=YouTube", "-metadata", "comment=" + track.url.absoluteString, output.path]
+    static func tags(for track: YouTubeTrack) -> AudioTags {
+        AudioTags(title: track.title, artist: track.artist, album: track.album ?? track.title,
+                  comment: track.url.absoluteString, year: track.year)
     }
 
-    static func encodeArguments(source: URL, output: URL, track: YouTubeTrack) -> [String] {
-        ["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", source.path, "-map", "0:a:0", "-vn",
-         "-c:a", "libmp3lame", "-q:a", "2", "-id3v2_version", "3", "-fs", "200000001",
-         "-metadata", "title=" + track.title, "-metadata", "artist=" + track.artist,
-         "-metadata", "album=YouTube", "-metadata", "comment=" + track.url.absoluteString, output.path]
+    static func m4aArguments(source: URL, output: URL, track: YouTubeTrack, codec: [String],
+                             tags: AudioTags? = nil, cover: URL? = nil) -> [String] {
+        let tagArguments = (tags ?? Self.tags(for: track)).ffmpegArguments(cover: cover)
+        var arguments: [String] = ["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", source.path]
+        arguments += tagArguments.inputs
+        arguments += ["-map", "0:a:0"] + codec + ["-fs", "200000001"]
+        arguments += tagArguments.outputs
+        return arguments + [output.path]
+    }
+
+    static func encodeArguments(source: URL, output: URL, track: YouTubeTrack, tags: AudioTags? = nil, cover: URL? = nil) -> [String] {
+        let tagArguments = (tags ?? Self.tags(for: track)).ffmpegArguments(cover: cover)
+        var arguments: [String] = ["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", source.path]
+        arguments += tagArguments.inputs
+        arguments += ["-map", "0:a:0", "-c:a", "libmp3lame", "-q:a", "2", "-id3v2_version", "3", "-fs", "200000001"]
+        arguments += tagArguments.outputs
+        return arguments + [output.path]
     }
 
     /// Output files avoid deadlocks; arguments never pass through a shell.

@@ -42,6 +42,27 @@ struct AudioTags {
     let artist: String
     let album: String
     let comment: String
+    var genre: String?
+    var year: Int?
+    /// Square JPEG cover art.
+    var artwork: Data?
+
+    /// FFmpeg options for these tags. With `cover` (the file of input #1) the picture is attached as album art.
+    func ffmpegArguments(cover: URL?) -> (inputs: [String], outputs: [String]) {
+        var outputs = ["-metadata", "title=" + title, "-metadata", "artist=" + artist,
+                       "-metadata", "album=" + album, "-metadata", "comment=" + comment]
+        if let genre = genre?.nonEmpty { outputs += ["-metadata", "genre=" + genre] }
+        if let year { outputs += ["-metadata", "date=" + String(year)] }
+        guard let cover else { return ([], ["-vn"] + outputs) }
+        return (["-i", cover.path], ["-map", "1:v:0", "-c:v", "copy", "-disposition:v:0", "attached_pic"] + outputs)
+    }
+
+    /// Writes the artwork next to the audio for FFmpeg, which reads it as a second input.
+    func coverFile(in directory: URL) -> URL? {
+        guard let artwork else { return nil }
+        let url = directory.appendingPathComponent("cover.jpg")
+        return (try? artwork.write(to: url)) == nil ? nil : url
+    }
 }
 
 enum DropError: LocalizedError {

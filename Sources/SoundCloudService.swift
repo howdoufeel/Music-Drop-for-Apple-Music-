@@ -17,6 +17,10 @@ struct SoundCloudTrack: Identifiable, Equatable {
     var duration: Double?
     var artwork: URL?
     var stream: SoundCloudStreamHint?
+    var genre: String?
+    var year: Int?
+    /// The release a track belongs to, when SoundCloud names one.
+    var album: String?
 
     var durationLabel: String {
         guard let duration, duration.isFinite, duration >= 0 else { return "" }
@@ -88,9 +92,13 @@ final class SoundCloudService: SoundCloudProviding {
     private var searchResults: [String: (date: Date, tracks: [SoundCloudTrack])] = [:]
     private var lastPrewarm = Date.distantPast
     private let now: () -> Date
+    private let artwork: (([URL], SoundCloudCancellation) -> Data?)?
 
+    /// `artwork` loads cover art for tagging; without it files get no picture.
     init(helper: URL? = nil, ffmpeg: URL? = nil, cache: URL? = nil,
-         searchClient: SoundCloudSearchClient? = nil, now: @escaping () -> Date = Date.init) {
+         searchClient: SoundCloudSearchClient? = nil, now: @escaping () -> Date = Date.init,
+         artwork: (([URL], SoundCloudCancellation) -> Data?)? = nil) {
+        self.artwork = artwork
         self.helper = helper ?? FileTools.extractor(in: Bundle.main.resourceURL ?? Bundle.main.bundleURL)
         self.ffmpeg = FileTools.ffmpeg(ffmpeg)
         self.cache = cache ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -144,7 +152,7 @@ final class SoundCloudService: SoundCloudProviding {
                   url.scheme == "https" || url.scheme == "http",
                   let title = item["title"] as? String, !title.isEmpty else { return nil }
             seen.insert(id)
-            let artist = (item["artist"] as? String) ?? (item["artists"] as? [String])?.first
+            let artist = (item["artist"] as? String)?.nonEmpty ?? (item["artists"] as? [String])?.first
                 ?? (item["uploader"] as? String) ?? "Автор не указан"
             var artwork: URL?
             if let value = item["thumbnail"] as? String, let imageURL = URL(string: value), imageURL.scheme == "https",
@@ -155,8 +163,12 @@ final class SoundCloudService: SoundCloudProviding {
                 String(text.unicodeScalars.map { CharacterSet.controlCharacters.contains($0) ? " " : String($0) }
                     .joined().trimmingCharacters(in: .whitespacesAndNewlines).prefix(maximum))
             }
-            return SoundCloudTrack(id: id, title: cleaned(title, maximum: 400), artist: cleaned(artist, maximum: 300),
-                                   url: url, duration: item["duration"] as? Double, artwork: artwork)
+            let tags = TrackMetadata.soundCloud(title: cleaned(title, maximum: 400), artist: cleaned(artist, maximum: 300))
+            return SoundCloudTrack(id: id, title: tags.title, artist: tags.artist,
+                                   url: url, duration: item["duration"] as? Double, artwork: artwork,
+                                   genre: (item["genre"] as? String).map { cleaned($0, maximum: 100) }?.nonEmpty,
+                                   year: TrackMetadata.year(item["release_year"]),
+                                   album: (item["album"] as? String).map { cleaned($0, maximum: 300) }?.nonEmpty)
         }
     }
 
@@ -209,18 +221,23 @@ final class SoundCloudService: SoundCloudProviding {
         try FileManager.default.createDirectory(at: working, withIntermediateDirectories: true)
         var success = false
         defer { if !success { try? FileManager.default.removeItem(at: working) } }
+        // The cover downloads alongside the audio and is ready by the time the file is tagged.
+        let cover = artwork.map { load in PendingResult { load(CoverArt.soundCloudURLs(track.artwork), cancellation) } }
+        func tags() -> AudioTags { Self.tags(for: track, artwork: cover?.value(waiting: 5)) }
         stage("Получаем аудио с SoundCloud…")
         do {
             if let stream = try searchClient.audioStream(for: track, cancellation: cancellation) {
                 let prepared = try preparedURL(for: track, working: working, fileExtension: stream.fileExtension)
                 stage("Скачиваем с SoundCloud…")
                 if stream.isHLS, try nativeHLS(stream, track: track, working: working, prepared: prepared,
-                                               ffmpeg: ffmpeg, cancellation: cancellation, progress: progress) {
+                                               ffmpeg: ffmpeg, tags: tags, cancellation: cancellation, progress: progress) {
                     success = true
                     return prepared
                 }
                 if let ffmpeg {
-                    _ = try run(ffmpeg, arguments: Self.nativeDownloadArguments(stream: stream, track: track, output: prepared),
+                    let fileTags = tags()
+                    _ = try run(ffmpeg, arguments: Self.nativeDownloadArguments(stream: stream, track: track, output: prepared, tags: fileTags,
+                                                                               cover: fileTags.coverFile(in: working)),
                                 cancellation: cancellation, timeout: 900)
                     try validatePrepared(prepared)
                     if cancellation.isCancelled { throw SoundCloudError.cancelled }
@@ -259,12 +276,14 @@ final class SoundCloudService: SoundCloudProviding {
         let ext = audio.pathExtension.lowercased()
         let outputExt = ext == "mp3" ? "mp3" : "m4a"
         let prepared = try preparedURL(for: track, working: working, fileExtension: outputExt)
-        var arguments = ["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", audio.path, "-map", "0:a:0", "-vn"]
+        let fileTags = tags()
+        let tagArguments = fileTags.ffmpegArguments(cover: fileTags.coverFile(in: working))
+        var arguments: [String] = ["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", audio.path]
+        arguments += tagArguments.inputs + ["-map", "0:a:0"]
         if ["mp3", "m4a", "aac"].contains(ext) { arguments += ["-c:a", "copy"] }
         else if ["wav", "flac", "aif", "aiff"].contains(ext) { arguments += ["-c:a", "alac"] }
         else { arguments += ["-c:a", "aac", "-b:a", "192k"] }
-        arguments += ["-metadata", "title=" + track.title, "-metadata", "artist=" + track.artist,
-                      "-metadata", "album=SoundCloud", "-metadata", "comment=" + track.url.absoluteString, prepared.path]
+        arguments += tagArguments.outputs + [prepared.path]
         _ = try run(ffmpeg, arguments: arguments, cancellation: cancellation, timeout: 300)
         try validatePrepared(prepared)
         try? FileManager.default.removeItem(at: audio)
@@ -276,7 +295,8 @@ final class SoundCloudService: SoundCloudProviding {
     /// AAC in MP4 segments needs only AVFoundation; other layouts use FFmpeg when it is installed.
     /// Returns false when FFmpeg should stream the playlist itself instead.
     private func nativeHLS(_ stream: SoundCloudAudioSource, track: SoundCloudTrack, working: URL, prepared: URL,
-                           ffmpeg: URL?, cancellation: SoundCloudCancellation, progress: @escaping (Double) -> Void) throws -> Bool {
+                           ffmpeg: URL?, tags: () -> AudioTags, cancellation: SoundCloudCancellation,
+                           progress: @escaping (Double) -> Void) throws -> Bool {
         let joined = working.appendingPathComponent("stream.hls")
         let media = working.appendingPathComponent("stream.mp4")
         defer {
@@ -295,12 +315,12 @@ final class SoundCloudService: SoundCloudProviding {
             }
             if cancellation.isCancelled { throw SoundCloudError.cancelled }
             var input = joined
+            let fileTags = tags()
             if prepared.pathExtension == "m4a", FileTools.isMP4(joined) {
                 try FileManager.default.moveItem(at: joined, to: media)
                 input = media
                 do {
-                    try AudioRemux.m4a(from: media, to: prepared, tags: AudioTags(title: track.title, artist: track.artist, album: "SoundCloud",
-                                                                                   comment: track.url.absoluteString), cancellation: cancellation)
+                    try AudioRemux.m4a(from: media, to: prepared, tags: fileTags, cancellation: cancellation)
                     try validatePrepared(prepared)
                     return true
                 } catch {
@@ -308,7 +328,8 @@ final class SoundCloudService: SoundCloudProviding {
                 }
             }
             guard let ffmpeg else { return false }
-            _ = try run(ffmpeg, arguments: Self.localPrepareArguments(input: input, track: track, output: prepared),
+            _ = try run(ffmpeg, arguments: Self.localPrepareArguments(input: input, track: track, output: prepared, tags: fileTags,
+                                                                     cover: fileTags.coverFile(in: working)),
                         cancellation: cancellation, timeout: 300)
             try validatePrepared(prepared)
             if cancellation.isCancelled { throw SoundCloudError.cancelled }
@@ -322,19 +343,30 @@ final class SoundCloudService: SoundCloudProviding {
         }
     }
 
-    static func localPrepareArguments(input: URL, track: SoundCloudTrack, output: URL) -> [String] {
-        ["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-protocol_whitelist", "file", "-i", input.path,
-         "-map", "0:a:0", "-vn", "-c:a", "copy", "-fs", "200000001",
-         "-metadata", "title=" + track.title, "-metadata", "artist=" + track.artist,
-         "-metadata", "album=SoundCloud", "-metadata", "comment=" + track.url.absoluteString, output.path]
+    /// A single without a named release becomes its own album, so its cover shows in the album grid.
+    static func tags(for track: SoundCloudTrack, artwork: Data? = nil) -> AudioTags {
+        AudioTags(title: track.title, artist: track.artist, album: track.album ?? track.title, comment: track.url.absoluteString,
+                  genre: track.genre, year: track.year, artwork: artwork)
     }
 
-    static func nativeDownloadArguments(stream: SoundCloudAudioSource, track: SoundCloudTrack, output: URL) -> [String] {
-        ["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-rw_timeout", "15000000",
-         "-protocol_whitelist", "https,tls,tcp", "-i", stream.url.absoluteString,
-         "-map", "0:a:0", "-vn", "-c:a", "copy", "-fs", "200000001",
-         "-metadata", "title=" + track.title, "-metadata", "artist=" + track.artist,
-         "-metadata", "album=SoundCloud", "-metadata", "comment=" + track.url.absoluteString, output.path]
+    static func localPrepareArguments(input: URL, track: SoundCloudTrack, output: URL, tags: AudioTags? = nil, cover: URL? = nil) -> [String] {
+        let tagArguments = (tags ?? Self.tags(for: track)).ffmpegArguments(cover: cover)
+        var arguments: [String] = ["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-protocol_whitelist", "file", "-i", input.path]
+        arguments += tagArguments.inputs
+        arguments += ["-map", "0:a:0", "-c:a", "copy", "-fs", "200000001"]
+        arguments += tagArguments.outputs
+        return arguments + [output.path]
+    }
+
+    static func nativeDownloadArguments(stream: SoundCloudAudioSource, track: SoundCloudTrack, output: URL,
+                                        tags: AudioTags? = nil, cover: URL? = nil) -> [String] {
+        let tagArguments = (tags ?? Self.tags(for: track)).ffmpegArguments(cover: cover)
+        var arguments: [String] = ["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-rw_timeout", "15000000",
+                                   "-protocol_whitelist", "https,tls,tcp", "-i", stream.url.absoluteString]
+        arguments += tagArguments.inputs
+        arguments += ["-map", "0:a:0", "-c:a", "copy", "-fs", "200000001"]
+        arguments += tagArguments.outputs
+        return arguments + [output.path]
     }
 
     private func preparedURL(for track: SoundCloudTrack, working: URL, fileExtension: String) throws -> URL {

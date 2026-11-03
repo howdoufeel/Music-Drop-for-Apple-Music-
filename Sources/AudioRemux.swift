@@ -12,12 +12,22 @@ enum AudioRemux {
         try? FileManager.default.removeItem(at: output)
         session.outputURL = output
         session.outputFileType = .m4a
-        session.metadata = [
+        var metadata = [
             item(.commonIdentifierTitle, tags.title),
             item(.commonIdentifierArtist, tags.artist),
             item(.commonIdentifierAlbumName, tags.album),
             item(.iTunesMetadataUserComment, tags.comment)
         ]
+        if let genre = tags.genre?.nonEmpty { metadata.append(item(.iTunesMetadataUserGenre, genre)) }
+        if let year = tags.year { metadata.append(item(.iTunesMetadataReleaseDate, String(year))) }
+        if let artwork = tags.artwork {
+            let cover = AVMutableMetadataItem()
+            cover.identifier = .iTunesMetadataCoverArt
+            cover.value = artwork as NSData
+            cover.dataType = kCMMetadataBaseDataType_JPEG as String
+            metadata.append(cover)
+        }
+        session.metadata = metadata
         let finished = DispatchSemaphore(value: 0)
         session.exportAsynchronously { finished.signal() }
         while finished.wait(timeout: .now() + 0.05) == .timedOut {
